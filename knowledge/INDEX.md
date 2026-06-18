@@ -4,10 +4,7 @@
 
 ## 分类列表
 
-> 暂无分类。第一条 Q&A 写入时，在此登记新分类，格式如下：
->
-> - [Python](./python.md) — Python 语言、标准库与常见问题
-> - [Git](./git.md) — 版本控制命令与工作流
-> - [Databases](./databases/INDEX.md) — 已细分，见子索引
+- [AI Agents](./ai-agents.md) — Agent 架构设计、Memory 系统、奖励机制、Skill 设计（含 Claude Code、OpenClaw）
+- [RAG 与 GraphRAG](./rag.md) — 检索增强生成、GraphRAG、知识图谱驱动的检索
 
 <!-- 细分说明：当某分类升级为目录时，这里的链接指向该目录的子 INDEX.md。 -->
