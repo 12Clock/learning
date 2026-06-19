@@ -1,0 +1,268 @@
+# 架构与设计
+
+> 涵盖：Agent 架构选型、多 Agent 分工与协作模式、链路路由、意图识别。
+
+## Q: Claude Code 这个 Agent 项目是怎么设计的？包含什么模块？
+
+Claude Code 作为一个 CLI agent 系统，包含以下核心模块：
+
+**1. 推理核心**
+- 底层 LLM（Claude 系列模型）作为推理引擎，支持多模型切换（Opus/Sonnet/Haiku）。
+
+**2. 工具系统（Tool System）**
+- **文件操作**：Read、Write、Edit、Glob、Grep —— 专用工具优先于通用 Bash。
+- **Bash**：执行任意 shell 命令，作为兜底工具。
+- **Agent**：子 agent 派生，支持并行工作（Explore、Plan、general-purpose 等专用类型）。
+- **Notebook**：Jupyter notebook 编辑能力。
+
+**3. 权限系统（Permission System）**
+- 三层控制：自动允许的操作 / 需用户审批的操作 / 拒绝的操作。
+- Allowlist / denylist 配置（`settings.json`）。
+- 高风险操作（git push、删除文件等）默认需要确认。
+
+**4. 记忆系统（Memory System）**
+- **CLAUDE.md**：人工编写的项目/用户级指令，层级加载（managed → user → project → local）。
+- **Auto Memory**：agent 自动学习并写入的经验（`~/.claude/projects/<project>/memory/`），启动时加载前 200 行。
+- **Session Memory**：会话内的对话摘要，会话间重置。
+
+**5. 上下文管理（Context Management）**
+- 接近上下文窗口限制时自动压缩历史消息。
+- `/compact` 命令手动触发压缩。
+- 支持 `@path/to/file` 语法引入外部文件（最多 4 层跳转）。
+
+**6. MCP（Model Context Protocol）**
+- 可扩展的工具服务器协议，接入 GitHub、数据库等外部服务。
+- 工具以 `mcp__<server>__<tool>` 命名，运行时动态加载。
+
+**7. Hooks 系统**
+- Shell 命令在特定事件时执行（tool call 前后、通知等）。
+- 用户可配置自动化行为（linting、格式化等）。
+
+**8. Skill 系统**
+- Markdown 文件定义的专用工作流，通过 `/skill-name` 或自动匹配触发。
+
+**9. Rules 系统**
+- `.claude/rules/` 目录下的规则文件，支持 `paths:` frontmatter 按文件路径条件加载。
+
+**整体架构模式**：单线程主循环（Gather Context → Take Action → Verify Results），LLM 作为中央调度器，通过 tool calling 与外部世界交互。上下文管理通过五层管线控制：Budget reduction → Snip → Microcompact → Context collapse → Auto-compact。权限系统采用 deny-first 7 层防御模型（工具预过滤 → 规则评估 → 模式约束 → ML 安全分类 → Shell 沙箱 → 会话隔离 → Hook 拦截），将权限提示减少了 84%。子 agent 拥有独立的上下文窗口，不能再嵌套派生子 agent。
+
+- 标签: `claude-code`, `architecture`, `agent-design`
+- 记录于: 2026-06-18
+
+## Q: Agent 项目用什么架构？LangGraph 还是自研？Master+Sub Agent 还是 Workflow？
+
+### 常见架构选型
+
+**框架选择：LangGraph vs 自研**
+
+| 维度 | LangGraph | 自研框架 |
+|---|---|---|
+| 优势 | 图抽象成熟、内置持久化/检查点/时间旅行、社区生态、与 LangChain 无缝集成 | 完全可控、无抽象泄漏、可针对业务深度定制、无框架升级兼容问题 |
+| 劣势 | 框架概念学习成本高、抽象黑箱增加调试难度、性能开销（序列化/反序列化） | 需自建持久化/重试/监控等基础设施、开发周期长 |
+| 适合场景 | 复杂多 Agent 编排、需要检查点和 human-in-the-loop、快速原型 | 业务逻辑高度定制、对延迟敏感、团队有足够工程能力 |
+
+**实践建议**：如果团队规模 ≤5 人且 Agent 逻辑相对确定，自研基于 Python async + 状态机的轻量框架通常更高效。LangGraph 的价值在复杂度高、需要频繁迭代编排逻辑时才显现。
+
+### 编排模式：Master+Sub vs Workflow
+
+**Master+Sub Agent（Supervisor 模式）**：
+- 一个 orchestrator agent 接收用户请求，动态决定调度哪些子 agent、以何种顺序执行
+- 路由决策由 LLM 做，灵活但不确定性高
+- 适合：用户意图多变、任务路径无法预定义的场景（如通用对话 agent、开放域问答）
+- 风险：supervisor 自身可能做出错误路由决策，需要做 fallback
+
+**Workflow 模式（DAG/Pipeline）**：
+- 预定义的有向无环图，每个节点是固定步骤，边是确定性条件分支
+- 路由由代码逻辑（if/else、状态判断）驱动，可预测、可测试
+- 适合：流程明确、步骤固定的业务场景（如表单填写、标准化报告生成）
+- 风险：灵活性差，新增路径需要改代码
+
+**实际选型：混合模式最常见**：
+- 整体用 **Workflow** 定义主链路（意图识别 → 检索 → 生成 → 后处理），保证基线稳定
+- 在关键决策点用 **LLM 路由**（如意图分类、是否需要追问、选择哪个检索策略）
+- Sub Agent 用于处理特定领域子任务（如代码生成、数据分析），各自有独立上下文和 prompt
+- Orchestrator 不做具体任务，只负责状态管理、错误处理和流程推进
+
+```
+用户输入 → [意图识别(LLM)] → 路由决策
+  ├─ 简单问答 → RAG Pipeline (Workflow)
+  ├─ 多轮对话 → Dialogue Agent (Sub Agent)
+  ├─ 复杂任务 → Task Planner → [Sub Agent 1, Sub Agent 2, ...] → 结果合并
+  └─ 兜底 → 通用生成
+```
+
+**选型核心原则**：不要为了用框架而用框架。先跑通单 Agent + 简单 pipeline，验证业务可行后再按需拆分 Agent 和引入编排框架。过早引入多 Agent 架构是最常见的过度工程。
+
+- 标签: `architecture`, `langgraph`, `workflow`, `supervisor`, `design-decision`
+- 记录于: 2026-06-19
+
+## Q: 项目中是单 Agent 还是多 Agent？各子 Agent 的核心任务和分工是什么？
+
+### 何时需要多 Agent
+
+**单 Agent 适用**：任务链路短（≤3 步）、不需要领域隔离、上下文窗口足够。大部分场景下，单 Agent + 良好的 prompt + 工具集 已经足够。
+
+**多 Agent 必要的信号**：
+1. **上下文冲突**：不同子任务需要截然不同的 system prompt（如代码生成 vs 自然语言对话），放在一个 prompt 里互相干扰
+2. **能力隔离**：某些子任务需要不同的模型（如用大模型做推理、小模型做分类）
+3. **并行需求**：多个独立子任务可以同时执行以降低延迟
+4. **错误隔离**：一个子任务失败不应阻塞其他子任务
+
+### 典型多 Agent 分工
+
+一个完整的对话式 Agent 系统通常包含以下角色：
+
+| Agent | 核心任务 | 模型选择 | 关键特点 |
+|---|---|---|---|
+| **意图识别 Agent** | 分类用户意图、提取关键实体、判断是否需要澄清 | 轻量模型（速度优先） | 延迟敏感，需要 <200ms |
+| **对话管理 Agent** | 维护对话状态、管理多轮上下文、决定下一步动作 | 中等模型 | 状态机 + LLM 混合驱动 |
+| **检索 Agent** | 查询改写、多路检索（向量/关键词/图谱）、结果排序 | 可用小模型做 reranking | 与外部数据源交互 |
+| **生成 Agent** | 基于检索结果和上下文生成最终回答 | 大模型（质量优先） | 消耗 token 最多的环节 |
+| **质量检查 Agent** | 检查幻觉、格式合规、安全过滤 | 中等模型 | 可选，但对 toB 场景重要 |
+| **工具执行 Agent** | 执行代码、调用 API、操作数据库 | 代码模型 | 需要沙箱隔离 |
+
+### 分工设计原则
+
+1. **单一职责**：每个 Agent 只做一件事，prompt 短且聚焦。一个 Agent 的 system prompt 超过 2000 tokens 就该考虑拆分。
+2. **接口清晰**：Agent 间通过结构化数据（JSON schema）通信，不传递自然语言。减少歧义，方便调试。
+3. **可独立评测**：每个 Agent 有自己的评测集，能独立迭代而不影响其他 Agent。
+4. **成本分层**：高频低价值任务用小模型，低频高价值任务用大模型。意图识别每次请求都跑，用 Haiku 级别；最终生成可能只在特定路径触发，用 Opus 级别。
+
+- 标签: `multi-agent`, `architecture`, `agent-division`, `design-pattern`
+- 记录于: 2026-06-19
+
+## Q: 首次生成和多轮补充的链路路由是怎么区分和实现的？
+
+### 核心区别
+
+**首次生成（Cold Start）**：用户发起新话题，系统无历史上下文。需要完整的意图识别 → 槽位提取 → 路由决策 → 检索 → 生成全链路。
+
+**多轮补充（Follow-up）**：用户在已有对话基础上追问、补充或修正。需要判断是"延续当前话题"还是"切换新话题"，并正确继承上下文。
+
+### 路由判断机制
+
+**Step 1：对话状态判断**
+
+```python
+# 核心信号
+signals = {
+    "has_history": len(conversation_history) > 0,
+    "coreference": detect_coreference(query),      # "它"、"这个"、"上面说的"
+    "topic_shift": compute_topic_similarity(query, last_topic),
+    "explicit_new": detect_new_topic_markers(query), # "换个话题"、"另外问一下"
+}
+```
+
+**判定规则**：
+- 无历史 → 首次生成
+- 有指代词且话题相似度 > 阈值 → 多轮补充
+- 有显式切换信号 → 当作新的首次生成
+- 话题相似度 < 阈值且无指代 → 新话题，走首次链路
+
+**Step 2：上下文继承**
+
+首次生成：
+```
+用户 Query → 意图识别 → 槽位提取 → 路由 → 检索(全量) → 生成
+```
+
+多轮补充：
+```
+用户 Query + 历史上下文 → 指代消解/Query 补全 → 增量槽位更新 → 路由(可复用) → 检索(增量) → 生成
+```
+
+关键差异：
+- **指代消解**：多轮时需要把"它怎么用？"解析为"LangGraph 的 checkpointer 怎么用？"
+- **槽位继承**：首次提取了"查询对象=LangGraph"，补充问"性能怎么样"时自动继承
+- **增量检索**：不重新全量搜索，而是基于追问内容做增量补充
+
+**Step 3：路由复用与更新**
+
+多轮场景下，路由决策有三种情况：
+1. **路径不变**：追问同一主题的细节 → 复用原路由，只追加检索
+2. **子路径切换**：从"介绍 X"变为"X 的代码示例" → 切换到代码生成子路径
+3. **完全切换**：话题跳转 → 重置状态，走首次生成链路
+
+### 实现关键
+
+- **对话状态管理**：用状态机 + 栈结构管理多轮上下文。每个话题是一个状态节点，追问压栈，切换出栈。
+- **LLM 辅助判断**：话题切换/延续的判断用 LLM 分类器（accuracy 通常 >95%），比规则判断更鲁棒。
+- **超时重置**：用户长时间未发言（如 >30min），自动视为新话题。
+- **显式控制**：提供"新对话"按钮或指令，让用户主动重置上下文。
+
+- 标签: `routing`, `multi-turn`, `dialogue-management`, `context-inheritance`
+- 记录于: 2026-06-19
+
+## Q: 并行化意图识别是什么？为什么要做并行化？如何实现？
+
+### 什么是并行化意图识别
+
+传统意图识别是串行的：先判断一级意图 → 再判断二级意图 → 再提取实体。每一步依赖上一步的结果，延迟叠加。
+
+**并行化意图识别**是将多个识别任务同时执行：
+- 多个维度的分类器并行运行（意图类型、情感、紧急度、领域）
+- 意图识别与实体提取并行
+- 多个候选意图同时验证
+
+### 为什么要做并行化
+
+1. **延迟是核心痛点**：意图识别处于链路最前端，每增加 100ms 都会被用户直接感知。串行的三级分类（一级→二级→实体）可能需要 3 次 LLM 调用，延迟 1-2s。
+2. **多维度信息互不依赖**：意图类型、情感倾向、紧急程度是正交维度，没有先后依赖关系。
+3. **提升召回率**：多个分类器独立判断，可以通过融合策略发现单一分类器遗漏的意图。
+4. **支持复合意图**：用户一句话可能包含多个意图（"帮我查天气，顺便设个闹钟"），并行识别每个意图比串行解析更自然。
+
+### 实现方式
+
+**方案一：多分类器并行 Fan-out**
+
+```python
+import asyncio
+
+async def parallel_intent(query: str):
+    # 多个识别任务并行执行
+    results = await asyncio.gather(
+        classify_intent_type(query),      # 意图类型（问答/任务/闲聊）
+        extract_entities(query),           # 实体提取（人名/地点/时间）
+        detect_sentiment(query),           # 情感分析
+        classify_domain(query),            # 领域分类（技术/生活/工作）
+        detect_urgency(query),             # 紧急程度
+    )
+    return merge_results(results)
+```
+
+**方案二：多模型/多 Prompt 投票**
+
+```python
+async def voting_intent(query: str):
+    # 同一任务用不同策略并行，取共识
+    results = await asyncio.gather(
+        llm_classifier(query, prompt_v1),   # LLM 分类（Prompt A）
+        llm_classifier(query, prompt_v2),   # LLM 分类（Prompt B）
+        rule_based_classifier(query),       # 规则分类（快但覆盖窄）
+        embedding_classifier(query),        # Embedding 相似度分类
+    )
+    return majority_vote(results)
+```
+
+**方案三：层级并行**
+
+```
+            ┌─ 一级意图分类 ─┐
+用户Query ─→├─ 实体提取     ├─→ 路由决策
+            └─ 情感分析     ─┘
+                 ↓（一级结果出来后）
+            ┌─ 二级意图细分 ─┐
+            └─ 槽位填充     ─┘─→ 执行
+```
+
+第一层完全并行；第二层等第一层的意图结果后再并行细分。相比全串行，延迟从 `T1+T2+T3+T4+T5` 降低到 `max(T1,T2,T3) + max(T4,T5)`。
+
+### 关键设计考量
+
+- **超时控制**：每个并行任务设独立超时（如 500ms），超时的分类器结果直接丢弃，用其他分类器的结果兜底。
+- **结果融合**：用加权投票（基于各分类器历史准确率）或优先级规则合并多个分类结果。
+- **成本控制**：并行调用 N 个 LLM 会使 token 消耗翻 N 倍。可以用轻量模型做大部分分类、大模型只在低置信度时介入。
+- **取消传播**：如果某个快速分类器已经高置信度（>0.95）确定了意图，可以取消其他还在运行的分类器以节省成本。
+
+- 标签: `intent-recognition`, `parallel`, `latency-optimization`, `fan-out`
+- 记录于: 2026-06-19
