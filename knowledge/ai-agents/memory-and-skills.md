@@ -205,3 +205,181 @@ skills/knowledge-collection/
 
 - 标签: `skill-design`, `agent-skill`, `progressive-disclosure`, `architecture`
 - 记录于: 2026-06-19
+
+## Q: Skill 过多会导致检索精确度降低，如何解决？
+
+### 问题本质
+
+Skill 数量增长带来三层递进的问题：
+
+1. **Token 膨胀**：每个 skill 的描述（name + description）需要注入 system prompt 以供 LLM 匹配。100 个 skill ≈ 10K tokens，500 个 skill ≈ 50K tokens——大量不相关的 skill 描述挤占上下文窗口，干扰模型对当前任务的注意力。
+2. **语义混淆**：skill 数量越多，描述之间的语义重叠越多。"代码审查" vs "代码质量检查" vs "代码安全扫描"——LLM 难以区分细微差异，导致误触发。
+3. **长尾失效**：常用 skill 被频繁匹配（模型对它们的描述"记住了"），低频 skill 在大量描述中被淹没，几乎永远不会被触发。
+
+### 解决方案体系
+
+**方案一：分层检索（Hierarchical Retrieval）**
+
+将 skill 组织为树状结构，分两级匹配：
+
+```
+Level 0: 领域分类（5-10 个）          ← 全部注入 system prompt（~1K tokens）
+Level 1: 具体 skill（每个领域 10-30 个） ← 只加载匹配领域的 skill
+
+用户输入 → 匹配领域 → 只加载该领域的 skill 列表 → 匹配具体 skill
+```
+
+```yaml
+domains:
+  - name: code-quality
+    description: 代码审查、测试、覆盖率相关
+    skills: [code-review, security-review, test-coverage, lint-fix]
+  - name: deployment
+    description: 部署、发布、CI/CD 相关
+    skills: [deploy-staging, deploy-prod, rollback, canary-release]
+```
+
+效果：搜索空间从 N 降到 ~N/K（K 为领域数），token 消耗从全量 skill 降到一个领域的 skill。
+
+**方案二：Embedding 检索 + 重排序（Retrieve & Rerank）**
+
+当 skill 数量 >50 时，不再把所有描述塞进 prompt，而是用向量检索做预筛选：
+
+```python
+class SkillRouter:
+    def __init__(self, skills: list[Skill]):
+        # 离线：将所有 skill 描述 embedding 化
+        self.index = build_vector_index([s.description for s in skills])
+        self.skills = skills
+    
+    def match(self, user_query: str, top_k: int = 5) -> list[Skill]:
+        # Step 1: 向量检索 Top-K 候选
+        candidates = self.index.search(embed(user_query), top_k=top_k)
+        
+        # Step 2: 将 Top-K 候选的完整描述注入 LLM，让 LLM 做精确选择
+        selected = llm_select(user_query, [self.skills[i] for i in candidates])
+        return selected
+```
+
+**关键设计**：
+- 向量检索做**召回**（高召回、可接受误差），LLM 做**精排**（高精度）
+- 只有 Top-K（通常 3-5 个）的 skill 描述进入 context，而非全量
+- 向量索引几乎零延迟（<10ms），不增加用户可感知的延迟
+
+**方案三：Skill 作为 Tool 定义（Structured Discovery）**
+
+将 skill 注册为 LLM 的 tool（function calling），利用模型原生的 tool 选择能力：
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "code_review",
+    "description": "Review code changes for correctness bugs and style issues",
+    "parameters": {
+      "effort": {"type": "string", "enum": ["low", "medium", "high"]}
+    }
+  }
+}
+```
+
+**优势**：
+- Tool 定义有结构化的 name + description + parameters，比自然语言描述更精确
+- LLM 对 tool calling 的训练做了专门优化，匹配精度高于从自由文本中解析意图
+- 支持参数约束（enum、required），进一步减少歧义
+
+**劣势**：
+- Tool 定义也消耗 token（每个约 100-200 tokens）
+- 数量上限受模型支持的 tool 数量限制（通常 64-128 个）
+
+**方案四：延迟加载 / Deferred Tools（Claude Code 的做法）**
+
+Claude Code 在 skill/tool 数量多时的策略：
+
+```
+启动时：只加载 skill 名称列表（零参数定义，~10 tokens/skill）
+触发时：通过 ToolSearch 按需加载完整 schema
+
+即：名称常驻 → 定义延迟加载
+```
+
+这样 500 个 skill 只消耗 ~5K tokens（仅名称），而非 ~100K tokens（完整定义）。用户输入匹配到名称后，再动态加载该 skill 的完整定义和参数。
+
+**方案五：描述优化 + 消歧规则**
+
+在 skill 数量有限（<50）但存在语义重叠时，优化描述本身：
+
+**精确化描述**：
+```yaml
+# 差：过于宽泛
+- name: review
+  description: 审查代码
+
+# 好：明确边界和使用场景
+- name: code-review
+  description: 审查当前分支 diff 中的正确性 bug 和代码质量问题。不做安全审查（用 security-review）。
+```
+
+**添加反向约束（Negative Examples）**：
+```yaml
+- name: code-review
+  description: >
+    审查代码变更的正确性和质量。
+    NOT for: 安全漏洞扫描（用 security-review）、
+    性能优化建议（用 perf-review）、
+    文档检查（用 doc-review）。
+```
+
+**添加触发示例**：
+```yaml
+- name: code-review
+  description: 审查代码变更
+  trigger_examples:
+    - "帮我 review 一下这个 PR"
+    - "检查一下代码有没有 bug"
+  non_trigger_examples:
+    - "这个接口有没有安全风险"     # → security-review
+    - "帮我写个单元测试"           # → test-gen
+```
+
+**方案六：热度感知 + 动态排序**
+
+```python
+class AdaptiveSkillRouter:
+    def __init__(self, skills):
+        self.skills = skills
+        self.usage_count = defaultdict(int)      # 使用频次
+        self.last_used = {}                       # 最近使用时间
+    
+    def get_prompt_skills(self, max_in_prompt: int = 20):
+        # 高频 skill 常驻 prompt，低频 skill 走检索
+        sorted_skills = sorted(
+            self.skills,
+            key=lambda s: self.usage_count[s.name],
+            reverse=True
+        )
+        hot_skills = sorted_skills[:max_in_prompt]    # Top-20 常驻
+        cold_skills = sorted_skills[max_in_prompt:]   # 其余走向量检索
+        return hot_skills, cold_skills
+```
+
+高频 skill 注入 prompt（保证常用场景的匹配速度和精度），低频 skill 通过向量检索按需加载（节省 token，牺牲少量延迟）。
+
+### 方案选择指南
+
+| Skill 数量 | 推荐方案 | 理由 |
+|---|---|---|
+| <20 | 描述优化 + 消歧规则 | 数量少，全量注入 prompt 可接受 |
+| 20-50 | Tool 定义 + 描述优化 | 利用 LLM 原生 tool calling 能力 |
+| 50-200 | 分层检索 或 Embedding 检索 | 全量注入 token 成本过高 |
+| 200+ | Embedding 检索 + 延迟加载 + 热度排序 | 多种策略组合 |
+
+### 核心原则
+
+1. **精度问题先从描述质量入手**——很多"检索不准"实际上是描述写得模糊，而非检索机制的问题
+2. **减少候选比优化排序更有效**——从 200 个 skill 中选 1 个很难，从 5 个候选中选 1 个很容易
+3. **分层是最通用的思路**——先粗筛再精排，每一层的搜索空间都可控
+4. **监控触发准确率**——定期统计 skill 的触发准确率，针对低准确率的 skill 优化描述或合并
+
+- 标签: `skill-retrieval`, `skill-routing`, `embedding-retrieval`, `scalability`, `deferred-loading`
+- 记录于: 2026-06-19
