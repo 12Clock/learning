@@ -679,3 +679,170 @@ class AgentScratchpad:
 
 - 标签: `long-context`, `information-pinning`, `structured-state`, `context-layering`, `scratchpad`
 - 记录于: 2026-06-20
+
+## Q: 用户提出模糊需求如"按老样子帮我订一下"，Agent 如何处理？
+
+### 模糊需求的类型
+
+| 类型 | 示例 | 缺什么 |
+|---|---|---|
+| **隐式引用历史** | "按老样子帮我订一下" | 缺"老样子"的具体内容 |
+| **省略关键参数** | "帮我订个机票" | 缺出发地/目的地/日期 |
+| **代词指代** | "帮我查一下那个" | 缺"那个"的具体指代 |
+| **主观描述** | "找个便宜点的" | 缺"便宜"的具体标准 |
+| **隐含意图** | "明天要出差" | 意图本身不明确（订机票？订酒店？查天气？） |
+
+### 处理框架：三步策略
+
+```
+模糊输入 → [1. 上下文消解] → [2. 记忆检索] → [3. 追问补全]
+           尝试从对话中推断    尝试从历史中回忆    实在不行就问用户
+```
+
+**核心原则：能推断就不问，必须问就精准问。**
+
+### 第 1 步：上下文消解
+
+从当前对话历史中寻找线索：
+
+```python
+def resolve_from_context(query: str, conversation: list) -> dict:
+    # 用 LLM 做指代消解和信息补全
+    resolved = llm.generate(
+        f"用户最新请求: {query}\n\n"
+        f"对话历史:\n{format_messages(conversation[-10:])}\n\n"
+        f"请解析用户的真实意图，补全缺失信息。"
+        f"如果某些信息可以从对话历史中推断，直接填入。"
+        f"如果无法推断，标记为 UNKNOWN。\n"
+        f"输出 JSON: {{intent, params: {{key: value|UNKNOWN}}}}"
+    )
+    return resolved
+```
+
+### 第 2 步：记忆检索
+
+"按老样子"的关键是**从长期记忆中找到"老样子"是什么**：
+
+```python
+class HabitResolver:
+    def __init__(self, memory_store):
+        self.memory = memory_store
+    
+    def resolve_habit(self, user_id: str, action: str) -> dict:
+        # 检索用户的历史行为模式
+        past_actions = self.memory.search(
+            query=f"用户 {user_id} 的 {action} 历史记录",
+            filters={"user_id": user_id, "action_type": action},
+            top_k=5,
+            sort_by="timestamp_desc",
+        )
+        
+        if not past_actions:
+            return {"resolved": False, "reason": "无历史记录"}
+        
+        # 提取最常见的模式
+        pattern = self.extract_pattern(past_actions)
+        return {
+            "resolved": True,
+            "pattern": pattern,
+            "confidence": pattern.frequency / len(past_actions),
+            "source": f"基于最近 {len(past_actions)} 次记录",
+        }
+    
+    def extract_pattern(self, actions: list) -> dict:
+        # 统计最常见的参数组合
+        # 例: 5 次订咖啡中 4 次是"大杯美式少冰" → 这就是"老样子"
+        from collections import Counter
+        param_counts = Counter(
+            tuple(sorted(a.params.items())) for a in actions
+        )
+        most_common = param_counts.most_common(1)[0]
+        return {
+            "params": dict(most_common[0]),
+            "frequency": most_common[1],
+        }
+```
+
+**"按老样子"的处理流程**：
+
+```
+"按老样子帮我订一下"
+  ↓
+1. 意图识别 → 动作: "订"（但订什么？）
+  ↓
+2. 上下文检查 → 当前对话中没有提到"订"的对象
+  ↓
+3. 记忆检索 → 查询该用户的"订"操作历史
+   → 找到: 最近 5 次都是"订下午茶，大杯美式少冰"
+  ↓
+4. 确认（高置信度时可跳过）:
+   "我帮你按之前的习惯订一杯大杯美式少冰，对吗？"
+  ↓
+5. 执行
+```
+
+### 第 3 步：追问补全
+
+当推断和记忆都无法解决时，**精准追问**——只问缺失的，不问已知的：
+
+```python
+def smart_clarification(intent: str, params: dict) -> str:
+    missing = [k for k, v in params.items() if v == "UNKNOWN"]
+    known = {k: v for k, v in params.items() if v != "UNKNOWN"}
+    
+    if not missing:
+        return None  # 信息完整，无需追问
+    
+    if len(missing) == 1:
+        # 只缺一个参数，直接问
+        return f"请问{PARAM_NAMES[missing[0]]}是？"
+    
+    if len(missing) <= 3:
+        # 缺 2-3 个，一次性问完（避免多轮来回）
+        questions = [PARAM_NAMES[m] for m in missing]
+        return f"还需要确认几个信息：{'、'.join(questions)}分别是？"
+    
+    # 缺太多参数 → 可能意图识别就错了，要求用户重述
+    return "您的需求我没太理解，能再详细说一下吗？"
+```
+
+### 追问的体验优化
+
+**给选项而非开放式提问**：
+
+```python
+# ❌ 差的追问
+"请问您想订什么？"
+
+# ✅ 好的追问（基于历史数据给出候选）
+"您想订哪个？\n1. 大杯美式少冰（您上次的选择）\n2. 拿铁\n3. 其他"
+```
+
+**多个缺失参数时，优先问最关键的**：
+
+```python
+PARAM_PRIORITY = {
+    "book_flight": ["destination", "date", "departure", "cabin_class"],
+    # destination 最关键（决定航线），cabin_class 最不关键（有默认值）
+}
+
+def prioritized_clarification(intent, missing_params):
+    priority_order = PARAM_PRIORITY.get(intent, missing_params)
+    # 先问优先级最高的参数，其他用默认值填充
+    top_missing = [p for p in priority_order if p in missing_params][:2]
+    return ask_for(top_missing)
+```
+
+### 设计原则
+
+| 原则 | 做法 |
+|---|---|
+| **能推断就不问** | 从上下文和记忆中尽量补全，减少追问次数 |
+| **问就精准问** | 只问缺失的参数，已知的不重复确认 |
+| **给选项** | 基于历史数据提供候选，减少用户输入成本 |
+| **高风险要确认** | 涉及支付/删除等操作，即使推断出来也要确认 |
+| **低风险可执行** | 低成本操作（如查询），推断后直接执行，错了再改 |
+| **记住结果** | 用户确认后将偏好存入长期记忆，下次直接用 |
+
+- 标签: `ambiguous-input`, `habit-resolution`, `clarification`, `user-memory`, `slot-filling`
+- 记录于: 2026-06-20

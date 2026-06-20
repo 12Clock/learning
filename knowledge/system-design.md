@@ -402,3 +402,228 @@ else:
 
 - 标签: `message-queue`, `async`, `decoupling`, `agent-infrastructure`, `database-vs-queue`
 - 记录于: 2026-06-20
+
+## Q: Kafka 在 AI Agent 系统中的使用场景？如何保证消息顺序性？
+
+### Kafka 核心特性回顾
+
+Kafka 与 RabbitMQ/Redis Streams 的本质区别在于它是**分布式提交日志**，而非传统消息队列：
+
+| 特性 | Kafka | 传统消息队列 |
+|---|---|---|
+| **消息模型** | 持久化日志（追加写入） | 投递后可删除 |
+| **消费模式** | Pull（消费者主动拉取） | Push（队列推给消费者） |
+| **消息回放** | 支持（任意 offset 重读） | 不支持（消费即删除） |
+| **吞吐** | 百万级/秒 | 万级/秒 |
+| **消息顺序** | 分区内有序 | 队列内有序 |
+
+### AI Agent 系统中的六大场景
+
+**1. Agent 轨迹日志（最典型场景）**
+
+```python
+# 每个 Agent 步骤都写入 Kafka
+producer.send("agent_traces", value={
+    "session_id": "sess_123",
+    "timestamp": "2026-06-20T10:30:00Z",
+    "step": 3,
+    "thought": "需要查询订单状态",
+    "action": "query_order",
+    "params": {"order_id": "ORD_456"},
+    "observation": {"status": "shipped"},
+    "latency_ms": 230,
+    "token_count": 450,
+})
+```
+
+**价值**：
+- 全量轨迹可回放——复现任何 Badcase
+- 下游消费者可独立分析（成本分析、质量审计、Badcase 挖掘）
+- 天然支持多消费者组（同一份日志，质量团队和成本团队各消费一份）
+
+**2. 事件驱动的 Agent 编排**
+
+```python
+# 多 Agent 通过 Kafka Topic 协作
+TOPICS = {
+    "task_assignments": "Supervisor → 工作 Agent 的任务分配",
+    "agent_results": "工作 Agent → Supervisor 的结果上报",
+    "agent_events": "Agent 间的事件通知（状态变更、依赖完成等）",
+}
+
+# Supervisor Agent 发布任务
+producer.send("task_assignments", key=b"research", value={
+    "task_id": "task_001",
+    "type": "research",
+    "query": "Redis 缓存策略最佳实践",
+    "deadline": "2026-06-20T11:00:00Z",
+})
+
+# Research Agent 消费任务
+consumer = KafkaConsumer("task_assignments", group_id="research_agents")
+for msg in consumer:
+    if msg.value["type"] == "research":
+        result = research_agent.execute(msg.value)
+        producer.send("agent_results", value=result)
+```
+
+**3. LLM 调用审计与合规**
+
+```python
+# 所有 LLM 调用都经过 Kafka 记录
+def audited_llm_call(prompt, model, user_id):
+    # 调用前记录
+    producer.send("llm_audit", value={
+        "event": "request",
+        "user_id": user_id,
+        "model": model,
+        "prompt_hash": hash(prompt),  # 不存原文，保护隐私
+        "timestamp": now(),
+    })
+    
+    response = llm.generate(prompt, model=model)
+    
+    # 调用后记录
+    producer.send("llm_audit", value={
+        "event": "response",
+        "user_id": user_id,
+        "tokens_used": response.usage.total_tokens,
+        "cost": calculate_cost(response.usage, model),
+        "has_tool_calls": bool(response.tool_calls),
+    })
+    
+    return response
+```
+
+**4. 实时监控与告警**
+
+```python
+# Kafka Streams / Flink 实时处理
+# 消费 agent_traces topic，计算实时指标
+
+def process_stream():
+    # 滑动窗口统计
+    window_stats = {
+        "error_rate_5min": errors_last_5min / total_last_5min,
+        "avg_latency_1min": sum(latencies_1min) / len(latencies_1min),
+        "tool_failure_rate": tool_errors / tool_calls,
+    }
+    
+    if window_stats["error_rate_5min"] > 0.05:
+        alert("Agent 错误率超过 5%", window_stats)
+    
+    if window_stats["avg_latency_1min"] > 5000:
+        alert("Agent 平均延迟超过 5 秒", window_stats)
+```
+
+**5. 异步工具调用解耦**
+
+```python
+# 长耗时工具（如数据分析、文件处理）通过 Kafka 异步执行
+producer.send("tool_requests", key=session_id.encode(), value={
+    "session_id": session_id,
+    "tool": "generate_report",
+    "params": {"data_range": "2026-Q1", "format": "pdf"},
+})
+
+# 工具 Worker 处理完成后回写
+producer.send("tool_results", key=session_id.encode(), value={
+    "session_id": session_id,
+    "tool": "generate_report",
+    "result": {"file_url": "https://..."},
+})
+
+# Agent 消费结果，继续对话
+```
+
+**6. 训练数据管道**
+
+```python
+# 线上 Agent 轨迹 → Kafka → 数据清洗 → 训练集
+# 用于 SFT 数据生产
+
+# Consumer: 过滤高质量轨迹用于训练
+consumer = KafkaConsumer("agent_traces", group_id="training_pipeline")
+for msg in consumer:
+    trace = msg.value
+    if trace["task_completed"] and trace["user_rating"] >= 4:
+        # 高质量轨迹 → 写入训练数据集
+        write_to_training_set(trace)
+```
+
+### 如何保证消息顺序性
+
+**Kafka 的顺序保证：分区（Partition）内有序，跨分区无序。**
+
+```
+Topic: agent_events (3 个分区)
+
+Partition 0: [msg1] [msg4] [msg7]   ← 内部严格有序
+Partition 1: [msg2] [msg5] [msg8]   ← 内部严格有序
+Partition 2: [msg3] [msg6] [msg9]   ← 内部严格有序
+
+跨分区: msg1 和 msg2 的顺序不保证
+```
+
+**关键：用 message key 控制分区分配。**
+
+```python
+# 同一 session_id 的消息总是进同一分区 → 保证单会话内有序
+producer.send(
+    "agent_traces",
+    key=session_id.encode(),      # 按 session_id 分区
+    value=trace_data,
+)
+
+# Kafka 的分区算法: partition = hash(key) % num_partitions
+# 同一 key → 同一 hash → 同一分区 → 顺序保证
+```
+
+**典型 key 选择**：
+
+| 场景 | 推荐 Key | 保证什么有序 |
+|---|---|---|
+| Agent 轨迹 | session_id | 同一会话的步骤有序 |
+| 用户操作 | user_id | 同一用户的操作有序 |
+| 订单处理 | order_id | 同一订单的状态变更有序 |
+| 工具调用 | tool_call_id | 同一调用的请求和响应有序 |
+
+**常见顺序性陷阱**：
+
+```python
+# ❌ 陷阱 1：消费者组内多实例竞争同一分区
+# 一个分区只能被同一消费者组中的一个实例消费
+# 如果实例数 > 分区数，多出的实例闲置
+
+# ❌ 陷阱 2：重试导致乱序
+# 消息 A 发送失败重试，消息 B 先到达 → A 和 B 乱序
+# 解决：设置 max.in.flight.requests.per.connection=1（牺牲吞吐换顺序）
+# 或使用幂等生产者：enable.idempotence=true
+
+# ❌ 陷阱 3：分区数变更导致 key 映射变化
+# 原来 hash("sess_123") % 3 = 1
+# 扩到 6 分区后 hash("sess_123") % 6 = 4
+# 同一 session 的新旧消息在不同分区 → 历史数据顺序断裂
+# 解决：提前规划足够的分区数，避免运行中扩分区
+```
+
+**严格全局有序（极少需要）**：
+
+```python
+# 只用 1 个分区 → 全局有序，但吞吐受限于单 Broker
+# 仅适用于低吞吐但严格有序的场景（如审计日志）
+admin.create_topic("strict_order_events", num_partitions=1)
+```
+
+### Kafka vs 其他方案的选择
+
+| 场景 | 推荐 | 理由 |
+|---|---|---|
+| Agent 轨迹日志 | **Kafka** | 高吞吐 + 持久化 + 多消费者 |
+| 简单任务队列 | **Redis Streams** | 低延迟，轻量 |
+| 复杂路由/优先级 | **RabbitMQ** | 灵活的 exchange + 优先级队列 |
+| Python 快速集成 | **Celery** | 开箱即用 |
+| 实时告警 | **Kafka + Flink** | 流处理 + 窗口聚合 |
+
+- 标签: `kafka`, `event-driven`, `message-ordering`, `partitioning`, `agent-infrastructure`, `audit`
+- 记录于: 2026-06-20

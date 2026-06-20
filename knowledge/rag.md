@@ -300,3 +300,278 @@ Query → BM25 检索子 chunk → Top-K₁
 
 - 标签: `rag`, `parent-child-index`, `bm25`, `hybrid-search`, `rrf`, `retrieval`
 - 记录于: 2026-06-20
+
+## Q: Elasticsearch 在 RAG 系统中的作用？如何优化检索性能？
+
+### ES 在 RAG 中的三个角色
+
+```
+用户 Query
+  ↓
+┌──────────────────────────────────────────┐
+│            Elasticsearch                  │
+│                                           │
+│  角色 1: BM25 关键词检索                   │
+│  角色 2: 向量检索 (dense_vector)           │
+│  角色 3: 混合检索 (BM25 + kNN + RRF)      │
+│                                           │
+└──────────────────────────────────────────┘
+  ↓ Top-K 文档
+  ↓ 送入 LLM 生成回答
+```
+
+### 角色 1：BM25 关键词检索
+
+ES 的核心能力——基于倒排索引的全文搜索：
+
+```json
+// 索引文档
+PUT /rag_documents/_doc/1
+{
+  "content": "Redis 支持五种数据结构：String、Hash、List、Set、Sorted Set",
+  "title": "Redis 数据结构",
+  "source": "redis-docs",
+  "chunk_id": "chunk_001",
+  "parent_id": "doc_001"
+}
+```
+
+```json
+// BM25 检索
+GET /rag_documents/_search
+{
+  "query": {
+    "match": {
+      "content": {
+        "query": "Redis 数据结构有哪些",
+        "analyzer": "ik_smart"  // 中文分词器
+      }
+    }
+  },
+  "size": 10
+}
+```
+
+**BM25 擅长**：精确关键词匹配、专有名词、编号/代码。
+**BM25 不擅长**：同义词（"LLM" vs "大模型"）、语义相似但无共同词。
+
+### 角色 2：向量检索（ES 8.x+）
+
+ES 8.x 原生支持 dense_vector 字段和 kNN 检索：
+
+```json
+// 索引时存储 embedding
+PUT /rag_documents/_doc/1
+{
+  "content": "Redis 支持五种数据结构...",
+  "embedding": [0.12, -0.34, 0.56, ...]  // 1536 维向量
+}
+```
+
+```json
+// kNN 向量检索
+GET /rag_documents/_search
+{
+  "knn": {
+    "field": "embedding",
+    "query_vector": [0.15, -0.30, 0.58, ...],  // query 的 embedding
+    "k": 10,
+    "num_candidates": 100  // HNSW 搜索范围
+  }
+}
+```
+
+### 角色 3：混合检索（最佳实践）
+
+ES 8.x 原生支持 BM25 + kNN + RRF 融合：
+
+```json
+GET /rag_documents/_search
+{
+  "query": {
+    "match": {
+      "content": "Redis 缓存策略"
+    }
+  },
+  "knn": {
+    "field": "embedding",
+    "query_vector": [0.15, -0.30, ...],
+    "k": 20,
+    "num_candidates": 100
+  },
+  "rank": {
+    "rrf": {
+      "window_size": 100,
+      "rank_constant": 60
+    }
+  },
+  "size": 10
+}
+```
+
+一次请求同时执行 BM25 和向量检索，用 RRF 融合结果——这是 RAG 中最推荐的检索方式。
+
+### 检索性能优化
+
+#### 1. 索引设计优化
+
+```json
+// 针对 RAG 场景优化的 mapping
+PUT /rag_documents
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "analysis": {
+      "analyzer": {
+        "rag_analyzer": {
+          "type": "custom",
+          "tokenizer": "ik_max_word",   // 索引时细粒度分词
+          "filter": ["lowercase", "synonym_filter"]
+        },
+        "rag_search_analyzer": {
+          "type": "custom",
+          "tokenizer": "ik_smart",       // 搜索时粗粒度分词
+          "filter": ["lowercase", "synonym_filter"]
+        }
+      },
+      "filter": {
+        "synonym_filter": {
+          "type": "synonym",
+          "synonyms": [
+            "LLM,大语言模型,大模型",
+            "RAG,检索增强生成"
+          ]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "content": {
+        "type": "text",
+        "analyzer": "rag_analyzer",
+        "search_analyzer": "rag_search_analyzer"
+      },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 1536,
+        "index": true,
+        "similarity": "cosine"  // 或 dot_product
+      },
+      "source": {"type": "keyword"},   // 精确匹配字段用 keyword
+      "parent_id": {"type": "keyword"},
+      "created_at": {"type": "date"}
+    }
+  }
+}
+```
+
+**关键优化点**：
+- 索引时用细粒度分词（`ik_max_word`），搜索时用粗粒度分词（`ik_smart`），提高召回率
+- 同义词过滤器解决"LLM"搜不到"大模型"的问题
+- `keyword` 类型用于过滤字段（不做全文搜索的字段不要用 `text`）
+
+#### 2. 查询优化
+
+```json
+// 优化前：全量字段搜索
+{"query": {"match": {"content": "Redis 缓存"}}}
+
+// 优化后：多字段加权 + 过滤 + 分页
+{
+  "query": {
+    "bool": {
+      "must": [
+        {"multi_match": {
+          "query": "Redis 缓存",
+          "fields": ["title^3", "content"],  // title 权重 3 倍
+          "type": "best_fields"
+        }}
+      ],
+      "filter": [
+        {"term": {"source": "official_docs"}},  // filter 不计算相关度，更快
+        {"range": {"created_at": {"gte": "2025-01-01"}}}
+      ]
+    }
+  },
+  "_source": ["content", "title", "parent_id"],  // 只返回需要的字段
+  "size": 10
+}
+```
+
+**性能优化清单**：
+
+| 优化 | 效果 | 原因 |
+|---|---|---|
+| **filter 代替 must** | 2-5x 快 | filter 不计算分数，可缓存 |
+| **_source 过滤** | 减少网络传输 | 不返回 embedding 等大字段 |
+| **keyword 代替 text** | 精确匹配更快 | 无需分词和相关度计算 |
+| **routing** | 减少扫描分片数 | 同一数据源的文档路由到同一分片 |
+| **预热缓存** | 首次查询更快 | `_search` 前先 `_warmers` |
+
+#### 3. 向量检索优化
+
+```json
+// HNSW 参数调优
+{
+  "mappings": {
+    "properties": {
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 1536,
+        "index": true,
+        "similarity": "cosine",
+        "index_options": {
+          "type": "hnsw",
+          "m": 16,              // 每个节点的邻居数（越大越准但越慢）
+          "ef_construction": 200 // 构建时搜索范围（越大索引越慢但质量越高）
+        }
+      }
+    }
+  }
+}
+```
+
+```json
+// 查询时调 num_candidates
+{
+  "knn": {
+    "field": "embedding",
+    "query_vector": [...],
+    "k": 10,
+    "num_candidates": 200  // 越大越准但越慢，通常设为 k 的 5-20 倍
+  }
+}
+```
+
+| 参数 | 增大效果 | 减小效果 |
+|---|---|---|
+| **m** | 更准确，索引更大 | 更快，准确度下降 |
+| **ef_construction** | 索引质量更高，构建更慢 | 构建更快 |
+| **num_candidates** | 查询更准确，更慢 | 查询更快，可能漏召回 |
+
+#### 4. 分片和硬件优化
+
+```
+经验法则:
+- 单分片大小控制在 10-50 GB
+- 分片数 = 数据总量 / 30GB（粗略估算）
+- 向量检索对内存要求高：1M 条 1536 维向量 ≈ 6GB 内存
+- 使用 SSD，向量检索的随机读很多
+```
+
+### ES vs 专用向量数据库
+
+| 维度 | Elasticsearch | Milvus / Pinecone |
+|---|---|---|
+| **BM25** | 原生支持（核心能力） | 不支持 |
+| **向量检索** | 8.x 支持（非核心，但够用） | 原生优化（更快更准） |
+| **混合检索** | 原生 RRF | 需外部融合 |
+| **运维成本** | 成熟生态，团队通常已有经验 | 新组件，需额外学习 |
+| **适用场景** | 已有 ES 基础设施 + 混合检索需求 | 纯向量检索 + 超大规模 |
+
+**实践建议**：如果团队已有 ES，直接用 ES 做混合检索是最快的 RAG 落地方案。向量检索性能略逊于 Milvus，但 BM25 + 向量 + RRF 的一站式体验是专用向量库做不到的。
+
+- 标签: `elasticsearch`, `rag`, `bm25`, `vector-search`, `hybrid-search`, `performance-tuning`
+- 记录于: 2026-06-20

@@ -606,3 +606,208 @@ def adaptive_reasoning(query, complexity_threshold=0.7):
 
 - 标签: `tree-of-thoughts`, `reasoning`, `cost-optimization`, `sample-and-vote`, `chain-of-thought`
 - 记录于: 2026-06-20
+
+## Q: 如何量化评估一个上线的 Agent 好坏？
+
+### 评估维度：四个核心层面
+
+Agent 的评估不能只看"回答对不对"——它涉及多步决策、工具调用、用户交互等多个环节，需要分层评估。
+
+```
+┌────────────────────────────────────────────┐
+│  Layer 4: 业务指标（最终价值）               │
+│  用户满意度、转化率、人工接管率               │
+├────────────────────────────────────────────┤
+│  Layer 3: 端到端任务指标                     │
+│  任务完成率、平均轮次、首次解决率             │
+├────────────────────────────────────────────┤
+│  Layer 2: 模块级指标                         │
+│  意图准确率、工具选择准确率、生成质量         │
+├────────────────────────────────────────────┤
+│  Layer 1: 系统级指标                         │
+│  延迟、吞吐、成本、可用性                    │
+└────────────────────────────────────────────┘
+```
+
+### Layer 1：系统级指标（基础设施）
+
+| 指标 | 计算方式 | 基准参考 |
+|---|---|---|
+| **P50/P95/P99 延迟** | 从用户发送到 Agent 回复的耗时 | P50 <2s, P95 <5s |
+| **吞吐量（QPS）** | 单位时间处理的请求数 | 取决于业务规模 |
+| **单次请求成本** | Token 消耗 × 单价 + 工具调用成本 | <$0.05/请求（一般场景） |
+| **可用性** | 成功响应数 / 总请求数 | >99.5% |
+| **错误率** | 异常/超时/空回复的比例 | <1% |
+
+```python
+# 系统指标采集
+metrics = {
+    "latency_p50": percentile(response_times, 50),
+    "latency_p95": percentile(response_times, 95),
+    "avg_tokens_per_request": sum(token_counts) / len(requests),
+    "avg_cost_per_request": sum(costs) / len(requests),
+    "error_rate": error_count / total_count,
+    "availability": success_count / total_count,
+}
+```
+
+### Layer 2：模块级指标（各环节质量）
+
+| 模块 | 指标 | 计算方式 |
+|---|---|---|
+| **意图识别** | Accuracy / F1 | 定期采样人工标注对比 |
+| **工具选择** | Tool Selection Accuracy | 选对工具的比例 |
+| **参数提取** | Slot Filling Rate | 必填参数正确提取率 |
+| **回答生成** | LLM-as-Judge 评分 | 用强模型打分（1-5） |
+| **安全** | 拒绝率 / 越权率 | 应拒绝的拒了 / 不应执行的执行了 |
+
+### Layer 3：端到端任务指标（核心）
+
+```python
+class TaskMetrics:
+    def compute(self, sessions: list[Session]) -> dict:
+        return {
+            # 1. 任务完成率（最重要的单一指标）
+            "task_completion_rate": self._completion_rate(sessions),
+            
+            # 2. 首次解决率（FCR）——一次交互就解决问题的比例
+            "first_contact_resolution": self._fcr(sessions),
+            
+            # 3. 平均解决轮次——完成任务需要多少轮对话
+            "avg_turns_to_resolve": self._avg_turns(sessions),
+            
+            # 4. 人工接管率——Agent 无法解决、转人工的比例
+            "human_handoff_rate": self._handoff_rate(sessions),
+            
+            # 5. 任务放弃率——用户中途放弃的比例
+            "abandonment_rate": self._abandonment_rate(sessions),
+        }
+    
+    def _completion_rate(self, sessions):
+        completed = sum(1 for s in sessions if s.task_completed)
+        return completed / len(sessions)
+    
+    def _fcr(self, sessions):
+        one_turn_success = sum(
+            1 for s in sessions 
+            if s.task_completed and s.turn_count <= 2
+        )
+        return one_turn_success / len(sessions)
+```
+
+### Layer 4：业务指标（最终价值）
+
+| 指标 | 含义 | 如何衡量 |
+|---|---|---|
+| **用户满意度（CSAT）** | 用户对 Agent 服务的评分 | 对话结束后弹出评分（1-5） |
+| **Net Promoter Score** | 用户推荐意愿 | 定期问卷 |
+| **人力成本节约** | Agent 替代了多少人工 | 对比部署前后人工工单量 |
+| **转化率** | 营销/推荐场景的转化 | 追踪 Agent 推荐后的成交 |
+| **留存率** | 用户是否继续使用 Agent | 7 日 / 30 日活跃率 |
+
+### 评估体系的实施
+
+**离线评估（上线前）**：
+
+```python
+# 用标注好的评测集评估
+def offline_evaluation(agent, test_set):
+    results = []
+    for case in test_set:
+        response = agent.run(case.query, context=case.context)
+        results.append({
+            "query": case.query,
+            "expected": case.expected_output,
+            "actual": response,
+            "intent_correct": response.intent == case.expected_intent,
+            "tool_correct": response.tool == case.expected_tool,
+            # LLM-as-Judge 评分
+            "quality_score": judge_llm.evaluate(
+                query=case.query,
+                expected=case.expected_output,
+                actual=response.text,
+                rubric="准确性(0-2) + 完整性(0-2) + 流畅性(0-1)"
+            ),
+        })
+    
+    return aggregate_metrics(results)
+```
+
+**线上评估（持续监控）**：
+
+```python
+# 建立监控 Dashboard
+ONLINE_METRICS = {
+    # 实时指标（秒级）
+    "realtime": ["latency_p95", "error_rate", "qps"],
+    
+    # 小时级指标
+    "hourly": [
+        "task_completion_rate",
+        "human_handoff_rate",
+        "avg_cost_per_request",
+    ],
+    
+    # 日级指标
+    "daily": [
+        "csat_score",
+        "abandonment_rate",
+        "low_confidence_ratio",  # 低置信度请求占比
+    ],
+    
+    # 周级指标
+    "weekly": [
+        "intent_accuracy",       # 人工抽样标注
+        "badcase_count",         # 发现的 Badcase 数
+        "new_intent_coverage",   # 新意图的覆盖率
+    ],
+}
+```
+
+**A/B 测试**：
+
+```python
+# 对比新旧 Agent 版本
+def ab_test(agent_a, agent_b, traffic_split=0.1):
+    """将 10% 流量导向新版本 B"""
+    if random.random() < traffic_split:
+        response = agent_b.run(query)
+        log_metric("agent_b", response)
+    else:
+        response = agent_a.run(query)
+        log_metric("agent_a", response)
+    return response
+
+# 对比维度
+comparison = {
+    "task_completion": {"A": 0.82, "B": 0.87},  # B 版本提升 5%
+    "avg_latency": {"A": 1.8, "B": 2.1},        # B 版本慢了 0.3s
+    "avg_cost": {"A": 0.03, "B": 0.04},          # B 版本贵了 33%
+    # → 权衡：完成率提升是否值得多花的成本和延迟？
+}
+```
+
+### 关键指标的优先级
+
+```
+上线初期:  任务完成率 > 错误率 > 延迟    （先保证能用）
+稳定期:    CSAT > 人工接管率 > 成本       （优化体验和效率）
+规模化:    成本 > 吞吐 > 延迟            （控制边际成本）
+```
+
+**一个实用的"Agent 健康度"综合评分**：
+
+```python
+def agent_health_score(metrics):
+    return (
+        0.30 * metrics["task_completion_rate"] +
+        0.20 * (1 - metrics["human_handoff_rate"]) +
+        0.15 * metrics["csat_normalized"] +
+        0.15 * (1 - metrics["error_rate"]) +
+        0.10 * (1 - metrics["latency_p95"] / MAX_ACCEPTABLE_LATENCY) +
+        0.10 * (1 - metrics["avg_cost"] / MAX_ACCEPTABLE_COST)
+    )
+```
+
+- 标签: `evaluation`, `online-metrics`, `task-completion`, `ab-testing`, `csat`, `agent-quality`
+- 记录于: 2026-06-20
