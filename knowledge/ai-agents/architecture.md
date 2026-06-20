@@ -614,3 +614,316 @@ class LazyToolLoader:
 
 - 标签: `tool-selection`, `tool-routing`, `embedding-retrieval`, `function-calling`, `scalability`
 - 记录于: 2026-06-20
+
+## Q: Multi-Agent 系统如何设计三层架构？Agent 之间如何通信？
+
+### 三层架构设计
+
+Multi-Agent 系统最常见的组织方式是**规划层→协调层→执行层**的三层架构：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  规划层（Planning Layer）                                │
+│  ┌───────────────┐                                      │
+│  │  Planner Agent │ ← 理解用户目标，拆解为子任务          │
+│  └───────┬───────┘                                      │
+│          │ 子任务列表 + 依赖关系                          │
+├──────────┼──────────────────────────────────────────────┤
+│  协调层（Coordination Layer）                            │
+│  ┌───────▼───────┐                                      │
+│  │ Orchestrator   │ ← 任务分配、状态追踪、结果汇总        │
+│  │ (Supervisor)   │                                      │
+│  └──┬──────┬──────┘                                     │
+│     │      │       任务分发                               │
+├─────┼──────┼────────────────────────────────────────────┤
+│  执行层（Execution Layer）                               │
+│  ┌──▼──┐ ┌▼────┐ ┌──────┐ ┌──────┐                     │
+│  │Code │ │Search│ │Review│ │Write │ ← 专精特定能力       │
+│  │Agent│ │Agent │ │Agent │ │Agent │                      │
+│  └──┬──┘ └──┬──┘ └──┬───┘ └──┬───┘                     │
+│     │       │       │        │                           │
+│  [工具集A] [工具集B] [工具集C] [工具集D]                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 各层职责
+
+#### 规划层（Planner Agent）
+
+```python
+class PlannerAgent:
+    """将复杂目标拆解为可执行的任务图"""
+    
+    def plan(self, user_goal: str) -> TaskGraph:
+        plan = self.llm.generate(
+            f"将以下目标拆解为具体的子任务，标注依赖关系:\n"
+            f"目标: {user_goal}\n\n"
+            f"输出格式:\n"
+            f"- task_id, description, dependencies[], assigned_agent"
+        )
+        
+        return TaskGraph.parse(plan)
+        # 例:
+        # T1: 调研竞品 → []              → SearchAgent
+        # T2: 编写代码 → [T1]            → CodeAgent
+        # T3: 代码审查 → [T2]            → ReviewAgent
+        # T4: 撰写文档 → [T2]            → WriteAgent
+        # T5: 汇总报告 → [T3, T4]        → Orchestrator
+```
+
+**关键设计**：
+- Planner 只规划，不执行——保持抽象层次
+- 输出结构化的**任务图**（DAG），而非线性列表
+- 可以动态重规划——执行过程中某步失败，Planner 调整后续计划
+
+#### 协调层（Orchestrator / Supervisor）
+
+```python
+class Orchestrator:
+    """管理任务的分发、监控和结果聚合"""
+    
+    def __init__(self, agents: dict[str, Agent]):
+        self.agents = agents
+        self.task_states = {}  # task_id → TaskState
+    
+    async def execute_plan(self, task_graph: TaskGraph):
+        while not task_graph.all_completed():
+            # 找到所有依赖已满足的任务
+            ready_tasks = task_graph.get_ready_tasks()
+            
+            # 并行分发
+            results = await asyncio.gather(*[
+                self.dispatch(task) for task in ready_tasks
+            ])
+            
+            # 更新状态
+            for task, result in zip(ready_tasks, results):
+                task_graph.mark_completed(task.id, result)
+                
+                # 失败处理
+                if not result.success:
+                    if result.retryable:
+                        task_graph.retry(task.id)
+                    else:
+                        # 通知 Planner 重新规划
+                        new_plan = self.planner.replan(
+                            original=task_graph,
+                            failure=result,
+                        )
+                        task_graph.update(new_plan)
+        
+        return task_graph.aggregate_results()
+    
+    async def dispatch(self, task: Task) -> TaskResult:
+        agent = self.agents[task.assigned_agent]
+        
+        # 设置超时和监控
+        try:
+            result = await asyncio.wait_for(
+                agent.execute(task),
+                timeout=task.timeout or 60,
+            )
+            self.task_states[task.id] = TaskState.COMPLETED
+            return result
+        except asyncio.TimeoutError:
+            self.task_states[task.id] = TaskState.TIMEOUT
+            return TaskResult(success=False, retryable=True)
+```
+
+**Orchestrator 的核心职责**：
+1. **依赖管理**：按 DAG 拓扑顺序调度，并行执行无依赖的任务
+2. **状态追踪**：每个任务的 pending/running/completed/failed 状态
+3. **故障处理**：超时重试、失败重分配、通知 Planner 重规划
+4. **结果聚合**：收集所有执行层的结果，汇总为最终输出
+
+#### 执行层（Specialist Agents）
+
+```python
+class CodeAgent(BaseAgent):
+    """专精代码编写的执行 Agent"""
+    
+    system_prompt = "你是一个代码专家，只负责编写代码。"
+    tools = [read_file, write_file, run_tests, search_code]
+    
+    async def execute(self, task: Task) -> TaskResult:
+        # 只关注自己领域的任务
+        response = await self.llm.chat(
+            system=self.system_prompt,
+            messages=[{"role": "user", "content": task.description}],
+            tools=self.tools,
+            context=task.dependencies_results,  # 上游任务的结果
+        )
+        return TaskResult(
+            success=True,
+            output=response,
+            artifacts=self.collect_artifacts(),  # 代码文件等
+        )
+```
+
+**执行层设计原则**：
+- **单一职责**：每个 Agent 只擅长一件事（写代码 / 搜索 / 审查）
+- **独立工具集**：每个 Agent 只能访问自己需要的工具
+- **无状态**：不保存跨任务的状态，所有上下文由 Orchestrator 传入
+- **可替换**：同一角色可以有多个实现（如 CodeAgent 可以用不同模型）
+
+### Agent 间通信方式
+
+#### 方式一：直接调用（Synchronous）
+
+```python
+# Orchestrator 直接调用 Agent 方法
+result = await code_agent.execute(task)
+# 简单直接，但紧耦合
+```
+
+**适用**：Agent 数量少（<5），无需分布式部署。
+
+#### 方式二：消息队列（Asynchronous）
+
+```python
+# 通过消息队列解耦
+class MessageBusProtocol:
+    async def publish(self, topic: str, message: AgentMessage):
+        await self.bus.send(topic, message.to_json())
+    
+    async def subscribe(self, topic: str, handler: Callable):
+        await self.bus.consume(topic, handler)
+
+# Agent 间通过 topic 通信
+TOPICS = {
+    "tasks.code": "CodeAgent 的任务队列",
+    "tasks.search": "SearchAgent 的任务队列",
+    "results": "所有 Agent 的结果上报",
+    "events": "系统事件（状态变更、告警等）",
+}
+
+# Orchestrator 发布任务
+await bus.publish("tasks.code", AgentMessage(
+    task_id="T2",
+    action="write_code",
+    payload={"spec": "实现用户认证模块", "language": "Python"},
+    reply_to="results",
+))
+
+# CodeAgent 消费并执行
+@bus.subscribe("tasks.code")
+async def handle_code_task(msg: AgentMessage):
+    result = await code_agent.execute(msg.payload)
+    await bus.publish("results", AgentMessage(
+        task_id=msg.task_id,
+        status="completed",
+        output=result,
+    ))
+```
+
+**适用**：Agent 需要独立部署/扩缩容，或任务量大需要负载均衡。
+
+#### 方式三：共享状态（Blackboard Pattern）
+
+```python
+class SharedBlackboard:
+    """所有 Agent 读写同一个共享状态"""
+    
+    def __init__(self):
+        self.state = {}
+        self.lock = asyncio.Lock()
+    
+    async def write(self, agent_id: str, key: str, value: Any):
+        async with self.lock:
+            self.state[key] = {
+                "value": value,
+                "written_by": agent_id,
+                "timestamp": datetime.now(),
+            }
+    
+    async def read(self, key: str) -> Any:
+        return self.state.get(key, {}).get("value")
+
+# Agent 通过黑板通信
+# SearchAgent 写入搜索结果
+await blackboard.write("search", "competitor_analysis", search_results)
+
+# CodeAgent 读取搜索结果作为参考
+context = await blackboard.read("competitor_analysis")
+```
+
+**适用**：Agent 需要共享中间结果，且结果被多个 Agent 使用。
+
+#### 方式四：事件驱动（Event-Driven）
+
+```python
+class EventBus:
+    def __init__(self):
+        self.handlers: dict[str, list[Callable]] = {}
+    
+    def on(self, event_type: str, handler: Callable):
+        self.handlers.setdefault(event_type, []).append(handler)
+    
+    async def emit(self, event_type: str, data: dict):
+        for handler in self.handlers.get(event_type, []):
+            await handler(data)
+
+# 注册事件处理
+event_bus.on("code_written", review_agent.on_code_ready)
+event_bus.on("review_passed", deploy_agent.on_review_passed)
+event_bus.on("review_failed", code_agent.on_review_feedback)
+
+# CodeAgent 完成后发射事件
+await event_bus.emit("code_written", {
+    "task_id": "T2",
+    "files": ["auth.py", "auth_test.py"],
+})
+# ReviewAgent 自动触发
+```
+
+**适用**：流程中存在条件分支和反馈循环（审查通过→部署，审查失败→重写）。
+
+### 通信方式对比
+
+| 方式 | 耦合度 | 延迟 | 可扩展性 | 适用规模 |
+|---|---|---|---|---|
+| **直接调用** | 高 | 最低 | 差 | 2-5 Agent |
+| **消息队列** | 低 | 中 | 好 | 5-50 Agent |
+| **共享状态** | 中 | 低 | 中 | 3-10 Agent |
+| **事件驱动** | 低 | 中 | 好 | 5-50 Agent |
+
+### 消息格式标准化
+
+不论用哪种通信方式，Agent 间的消息格式应统一：
+
+```python
+@dataclass
+class AgentMessage:
+    msg_id: str                  # 唯一消息 ID
+    task_id: str                 # 所属任务 ID
+    sender: str                  # 发送者 Agent ID
+    receiver: str                # 接收者（或 topic）
+    msg_type: str                # request / response / event / error
+    payload: dict                # 业务数据
+    metadata: dict               # 追踪信息
+    timestamp: datetime
+    
+    # 追踪链路
+    trace_id: str                # 分布式追踪 ID
+    parent_msg_id: str = None    # 父消息（用于构建调用链）
+```
+
+### 实际框架的三层实现
+
+| 框架 | 规划层 | 协调层 | 执行层 | 通信方式 |
+|---|---|---|---|---|
+| **LangGraph** | 自定义节点 | StateGraph + Supervisor 节点 | Tool-calling Agent 节点 | 共享 State |
+| **CrewAI** | Manager Agent | Process（sequential/hierarchical） | Crew Members | 直接调用 |
+| **AutoGen** | UserProxy 定义任务 | GroupChat Manager | Conversable Agents | 消息传递 |
+| **OpenAI Agents SDK** | 自定义 | Handoff 机制 | 各 Agent | 直接调用 |
+
+### 设计原则
+
+1. **规划和执行分离**：Planner 不执行，Executor 不规划——关注点分离
+2. **协调层是唯一的信息枢纽**：执行层 Agent 之间不直接通信，都经过 Orchestrator
+3. **消息格式标准化**：统一的消息协议让 Agent 可替换、可组合
+4. **从简单开始**：先用直接调用，遇到瓶颈再引入消息队列——不要过早架构
+5. **可观测性**：每条消息带 trace_id，完整追踪任务从规划到执行的全链路
+
+- 标签: `multi-agent`, `three-layer-architecture`, `orchestration`, `communication`, `message-bus`, `event-driven`
+- 记录于: 2026-06-20
