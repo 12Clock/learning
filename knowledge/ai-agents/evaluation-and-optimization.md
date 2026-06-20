@@ -427,3 +427,182 @@ RL  = 实战 + 复盘（优化策略）
 
 - 标签: `agentic-training`, `cpt`, `sft`, `rl`, `observation-masking`, `reward-design`
 - 记录于: 2026-06-20
+
+## Q: Tree of Thoughts 在线上系统中能用吗？如何平衡成本和效果？
+
+### Tree of Thoughts（ToT）原理
+
+ToT 是 Chain-of-Thought（CoT）的扩展——CoT 是线性推理链，ToT 是**树形推理**：
+
+```
+CoT（单路径）:
+  问题 → 步骤1 → 步骤2 → 步骤3 → 答案
+
+ToT（多路径探索）:
+  问题 → 步骤1a ─→ 步骤2a ─→ 步骤3a → 答案A ← 评估：好
+       → 步骤1b ─→ 步骤2b ─→ ✗ (剪枝)
+       → 步骤1c ─→ 步骤2c ─→ 步骤3c → 答案C ← 评估：差
+                                              ↓
+                                          选择答案 A
+```
+
+**核心组件**：
+1. **思维生成（Thought Generation）**：在每个节点生成多个候选下一步（通常 3-5 个）
+2. **状态评估（State Evaluation）**：用 LLM 评估每个候选的前景
+3. **搜索策略（Search Strategy）**：BFS 或 DFS 遍历思维树
+4. **剪枝（Pruning）**：丢弃评估得分低的分支
+
+```python
+class TreeOfThoughts:
+    def __init__(self, llm, branching_factor=3, max_depth=3):
+        self.llm = llm
+        self.b = branching_factor  # 每步生成几个候选
+        self.max_depth = max_depth
+    
+    def solve(self, problem: str) -> str:
+        root = ThoughtNode(state=problem, depth=0)
+        
+        # BFS 搜索
+        frontier = [root]
+        for depth in range(self.max_depth):
+            candidates = []
+            for node in frontier:
+                # 生成 b 个候选下一步
+                thoughts = self.generate_thoughts(node.state, k=self.b)
+                for thought in thoughts:
+                    child = ThoughtNode(
+                        state=node.state + "\n" + thought,
+                        depth=depth + 1,
+                        parent=node,
+                    )
+                    # 评估这个思路的前景
+                    child.score = self.evaluate(child.state)
+                    candidates.append(child)
+            
+            # 只保留得分最高的 b 个节点继续探索
+            frontier = sorted(candidates, key=lambda x: x.score, reverse=True)[:self.b]
+        
+        return frontier[0].state  # 返回最优路径
+    
+    def generate_thoughts(self, state, k):
+        return self.llm.generate(
+            f"给定当前推理状态:\n{state}\n\n"
+            f"请生成 {k} 种不同的下一步推理方向。",
+            n=k  # 生成 k 个候选
+        )
+    
+    def evaluate(self, state):
+        score = self.llm.generate(
+            f"评估以下推理过程的质量（1-10 分）:\n{state}\n"
+            f"考虑：逻辑是否正确？是否朝正确方向前进？"
+        )
+        return float(score)
+```
+
+### 成本分析
+
+**ToT 的成本是 CoT 的 N 倍**：
+
+```
+CoT: 1 次 LLM 调用
+ToT: 每层 b 个候选 × 每个候选 1 次生成 + 1 次评估
+     = 每层 2b 次调用
+     × depth 层
+     = 2 × b × depth 次调用
+
+例: b=3, depth=3 → 18 次 LLM 调用（vs CoT 的 1 次）
+成本: ~18 倍
+延迟: ~6 倍（3 层串行，每层内可并行）
+```
+
+### 线上系统能用吗？
+
+**直接用 ToT 论文的实现，大多数线上系统用不了。** 原因：
+
+| 限制 | 详情 |
+|---|---|
+| **延迟** | 18 次 LLM 调用，即使并行也需 3 轮串行（每轮 ~500ms），总延迟 1.5s+ |
+| **成本** | 单次请求成本 ×18，日均 100 万请求 → 成本从 $5K 变 $90K |
+| **复杂度** | 需要实现搜索树管理、并行调用、结果聚合 |
+
+**但 ToT 的思想可以以轻量形式落地**：
+
+### 轻量化方案
+
+**方案一：Sample + Vote（最简单的"ToT"）**
+
+```python
+def sample_and_vote(query, n=3):
+    # 生成 n 个独立回答（并行，可用低温度增加多样性）
+    responses = [
+        llm.generate(query, temperature=0.7)
+        for _ in range(n)
+    ]
+    
+    # 让 LLM 投票选最佳
+    best = llm.generate(
+        f"以下是对同一问题的 {n} 个回答:\n"
+        + "\n".join(f"方案{i+1}: {r}" for i, r in enumerate(responses))
+        + f"\n\n请选择最佳方案并说明理由。"
+    )
+    return best
+```
+
+**成本**：n+1 次调用（而非 2×b×depth），n=3 时只有 4 次，延迟 2 轮（生成并行 + 评估）。
+
+**方案二：Best-of-N（纯采样）**
+
+```python
+def best_of_n(query, n=5, evaluator=None):
+    responses = parallel_generate(query, n=n, temperature=0.8)
+    
+    if evaluator:
+        # 外部评估器（如规则或小模型）
+        scores = [evaluator.score(r) for r in responses]
+    else:
+        # 自评估：让 LLM 给每个回答打分
+        scores = [
+            llm.score(f"评估回答质量(1-10): {r}")
+            for r in responses
+        ]
+    
+    return responses[scores.index(max(scores))]
+```
+
+**方案三：条件触发的深度推理**
+
+```python
+def adaptive_reasoning(query, complexity_threshold=0.7):
+    # 快速估计问题复杂度
+    complexity = estimate_complexity(query)
+    
+    if complexity < 0.3:
+        return llm.generate(query)  # 简单问题：直接回答
+    elif complexity < complexity_threshold:
+        return llm.generate(query, system="请一步步思考")  # 中等：CoT
+    else:
+        return sample_and_vote(query, n=3)  # 复杂：轻量 ToT
+```
+
+**效果**：只对 5-10% 的高复杂度请求使用多路推理，整体成本增加 <20%，但这些难题的准确率提升 15-30%。
+
+### 成本效果平衡策略
+
+| 策略 | 成本倍数 | 延迟增加 | 效果提升 | 适用场景 |
+|---|---|---|---|---|
+| **直接回答** | 1x | 0 | 基准 | 简单事实查询 |
+| **CoT** | 1x-1.5x | ~0 | +10-15% | 需要推理的问题 |
+| **Sample+Vote** | 4x | 2 轮 | +15-20% | 高价值决策 |
+| **Best-of-N** | Nx | 1 轮 | +10-15% | 有自动评估器时 |
+| **完整 ToT** | 18x+ | 3+ 轮 | +20-30% | 离线/研究/极高价值 |
+
+### 实际落地建议
+
+1. **CoT 已经足够好**：对大多数线上场景，在 prompt 中加"请逐步思考"就能获得 80% 的收益
+2. **Sample+Vote 是最佳性价比**：当 CoT 不够时，生成 3 个候选 + 1 次评估，成本可控
+3. **完整 ToT 留给离线**：离线数据分析、难题求解、生成训练数据等不要求实时响应的场景
+4. **用便宜模型做探索**：生成候选用 Haiku/GPT-4o-mini，评估用 Sonnet/GPT-4o，降低成本
+5. **缓存复用**：相似问题的搜索树可以缓存和复用中间节点
+
+- 标签: `tree-of-thoughts`, `reasoning`, `cost-optimization`, `sample-and-vote`, `chain-of-thought`
+- 记录于: 2026-06-20

@@ -509,3 +509,173 @@ class HybridContextManager:
 
 - 标签: `context-management`, `sliding-window`, `dynamic-summary`, `context-overflow`, `memory`
 - 记录于: 2026-06-20
+
+## Q: 长上下文对话中如何让 Agent 不忘记关键信息？除了向量检索还有什么方法？
+
+### 为什么会"忘记"
+
+LLM 在长上下文中遗失信息的三个根本原因（详见 intent-recognition/challenges.md 中的分析）：
+1. **U 形注意力分布**：开头和结尾注意力高，中间低
+2. **信息稀释**：50 token 的关键信息淹没在 5000+ token 的后续对话中
+3. **Recency bias**：模型过度依赖最近几轮
+
+### 方法一：关键信息锚定（Information Pinning）
+
+**核心思想**：将关键信息从"中间"移到"高注意力区域"（开头或结尾）。
+
+```python
+class InformationPinner:
+    def __init__(self):
+        self.pinned_facts = []  # 关键事实
+    
+    def pin(self, fact: str, source_turn: int):
+        self.pinned_facts.append({
+            "content": fact,
+            "source": f"Turn {source_turn}",
+            "pinned_at": datetime.now(),
+        })
+    
+    def build_messages(self, system_prompt, conversation):
+        # 关键信息注入到 system prompt 末尾（高注意力区域）
+        pinned_section = "\n".join(
+            f"- {f['content']}（来自{f['source']}）"
+            for f in self.pinned_facts
+        )
+        
+        enhanced_system = (
+            f"{system_prompt}\n\n"
+            f"## 当前对话的关键信息（务必牢记）\n"
+            f"{pinned_section}"
+        )
+        
+        return [
+            {"role": "system", "content": enhanced_system},
+            *conversation,
+            # 也在最后一条 user 消息前再提醒一次（利用 recency bias）
+            {"role": "system", "content": f"提醒：{pinned_section}"},
+        ]
+```
+
+**何时触发 pin**：
+- 用户明确说了偏好或约束（"我要经济舱"、"预算不超过 5000"）
+- Agent 确认了关键决策（"已确认退款金额为 299 元"）
+- 多步任务中的中间结果（"第一步查询结果：航班 CA1234"）
+
+### 方法二：结构化状态摘要（Structured State Summary）
+
+不是保留原始对话，而是维护一个**结构化的状态对象**，每轮更新：
+
+```python
+class ConversationState:
+    def __init__(self):
+        self.task_goal = ""            # 用户的核心目标
+        self.confirmed_facts = {}      # 已确认的事实
+        self.pending_questions = []    # 待解决的问题
+        self.decisions_made = []       # 已做出的决策
+        self.constraints = []          # 用户的约束条件
+    
+    def update(self, llm, latest_turn: str):
+        # 用 LLM 从最新对话中提取结构化信息更新状态
+        update = llm.extract(
+            f"当前状态:\n{self.to_json()}\n\n"
+            f"最新对话:\n{latest_turn}\n\n"
+            f"请更新状态中的各字段（只更新有变化的）。"
+        )
+        self.merge(update)
+    
+    def to_prompt(self) -> str:
+        return f"""## 当前任务状态
+目标: {self.task_goal}
+已确认: {json.dumps(self.confirmed_facts, ensure_ascii=False)}
+待解决: {self.pending_questions}
+已决策: {self.decisions_made}
+约束: {self.constraints}"""
+```
+
+**优势**：状态摘要的信噪比远高于原始对话。200 token 的状态摘要可以替代 2000 token 的对话历史，且关键信息不会丢失。
+
+### 方法三：周期性重述（Periodic Recap）
+
+每隔 N 轮（如 5 轮），在 prompt 中插入一段系统消息，总结到目前为止的关键内容：
+
+```python
+def maybe_inject_recap(messages, turn_count, llm):
+    if turn_count % 5 == 0 and turn_count > 0:
+        recap = llm.generate(
+            f"请用 3-5 句话总结以下对话的关键信息、未完成的任务和用户的核心需求:\n"
+            f"{format_recent_turns(messages, last_n=10)}"
+        )
+        messages.insert(-1, {
+            "role": "system",
+            "content": f"[对话回顾] {recap}"
+        })
+```
+
+### 方法四：分层上下文管理
+
+```
+┌──────────────────────────────────────┐
+│  Layer 0: System Prompt              │  ← 始终在上下文头部
+│  - Agent 身份和能力                   │
+│  - 工具定义                           │
+├──────────────────────────────────────┤
+│  Layer 1: Pinned 关键信息            │  ← 紧随 system prompt
+│  - 用户偏好/约束                      │
+│  - 已确认的关键事实                   │
+│  - 当前任务状态                       │
+├──────────────────────────────────────┤
+│  Layer 2: 历史摘要（压缩）            │  ← 中间（低注意力区域放低密度信息）
+│  - 早期对话的摘要                     │
+├──────────────────────────────────────┤
+│  Layer 3: 最近 N 轮原文              │  ← 尾部（高注意力区域放最新信息）
+│  - 最近的对话详情                     │
+│  - 最新工具调用结果                   │
+├──────────────────────────────────────┤
+│  Layer 4: 再次提醒                   │  ← 最后注入（利用 recency bias）
+│  - 重复关键约束                       │
+└──────────────────────────────────────┘
+```
+
+### 方法五：外部记忆存储（非向量检索的方式）
+
+除了向量检索，还有其他外部存储方式：
+
+| 方式 | 机制 | 优点 | 缺点 |
+|---|---|---|---|
+| **Key-Value 存储** | 显式 key 检索（用户名→偏好） | 精确、快速 | 需预定义 key 结构 |
+| **知识图谱** | 实体-关系图上的遍历 | 支持关系推理 | 构建成本高 |
+| **SQL 数据库** | 结构化查询 | 精确查询、支持聚合 | 需定义 schema |
+| **对话日志检索** | BM25 关键词搜索 | 精确关键词命中 | 无语义理解 |
+| **Scratchpad** | Agent 维护的文本文件笔记 | 灵活、可读 | 需 Agent 主动维护 |
+
+```python
+# Scratchpad 模式：Agent 自己维护笔记
+class AgentScratchpad:
+    def __init__(self):
+        self.notes = ""
+    
+    def update_note(self, content: str):
+        """Agent 主动调用此工具记录关键信息"""
+        self.notes += f"\n[{datetime.now().strftime('%H:%M')}] {content}"
+    
+    def read_notes(self) -> str:
+        return self.notes
+```
+
+让 Agent 有一个 `save_note` 工具——当它判断某个信息重要时，主动保存到笔记中。后续需要时调用 `read_notes` 检索。
+
+### 各方法对比
+
+| 方法 | 额外 LLM 调用 | 信息保真度 | 适用场景 |
+|---|---|---|---|
+| **信息锚定** | 无 | 高（原文保留） | 关键约束/偏好 |
+| **结构化状态** | 每轮 1 次 | 中（提炼后） | 任务型对话 |
+| **周期性重述** | 每 5 轮 1 次 | 中 | 通用长对话 |
+| **分层上下文** | 压缩时 1 次 | 中高 | 所有场景 |
+| **向量检索** | 检索时 0 次 | 高（原文） | 超长对话/跨会话 |
+| **Scratchpad** | Agent 自主 | 取决于 Agent | 需要精确记忆的任务 |
+
+**实践建议**：信息锚定 + 分层上下文是性价比最高的组合——零额外 LLM 调用，通过合理安排信息位置就能显著减少遗忘。
+
+- 标签: `long-context`, `information-pinning`, `structured-state`, `context-layering`, `scratchpad`
+- 记录于: 2026-06-20

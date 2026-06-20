@@ -447,3 +447,170 @@ messages = [
 
 - 标签: `react`, `tool-calling`, `message-format`, `agent-loop`, `function-calling`
 - 记录于: 2026-06-20
+
+## Q: 工具库有上百个工具时，如何让模型快速准确地选择工具？
+
+### 问题本质
+
+LLM 的 function calling 在工具数量少（<20）时表现良好，但工具数增多后面临两个核心问题：
+
+1. **Token 成本爆炸**：100 个工具的定义 ≈ 20K-50K tokens，每次请求都要传入
+2. **选择准确率下降**：搜索空间太大，LLM 在 100 个工具中选对的概率远低于 10 个
+
+### 解决方案一：分层路由（Hierarchical Routing）
+
+```
+用户输入 → [领域分类器] → 领域标签 → [只加载该领域的工具] → LLM 选择
+           (轻量模型)     "支付"      (5-10 个工具)
+```
+
+```python
+DOMAIN_TOOLS = {
+    "payment": ["create_payment", "query_payment", "refund", "cancel_payment"],
+    "order": ["create_order", "query_order", "modify_order", "cancel_order"],
+    "user": ["get_profile", "update_profile", "reset_password"],
+    "logistics": ["track_package", "estimate_delivery", "change_address"],
+}
+
+def route_and_select(query: str):
+    # 第一步：轻量分类器选领域（<5ms）
+    domain = classify_domain(query)  # BERT 或规则
+    
+    # 第二步：只传入该领域的工具定义给 LLM
+    relevant_tools = DOMAIN_TOOLS[domain]  # 5-10 个，而非 100 个
+    
+    result = llm.chat(
+        messages=[{"role": "user", "content": query}],
+        tools=get_tool_definitions(relevant_tools),  # 小搜索空间
+    )
+    return result
+```
+
+**效果**：搜索空间从 100 → 5-10，token 消耗降低 80%+，选择准确率显著提升。
+
+### 解决方案二：Embedding 检索 + 重排序
+
+```python
+class ToolRetriever:
+    def __init__(self, tools: list[Tool]):
+        # 预计算每个工具的 embedding
+        self.tool_embeddings = {
+            tool.name: embed(tool.description + tool.usage_examples)
+            for tool in tools
+        }
+        self.tools = {t.name: t for t in tools}
+    
+    def retrieve(self, query: str, top_k=8) -> list[Tool]:
+        query_embedding = embed(query)
+        
+        # 语义检索 Top-K 候选工具
+        scores = {
+            name: cosine_similarity(query_embedding, tool_emb)
+            for name, tool_emb in self.tool_embeddings.items()
+        }
+        
+        top_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [self.tools[name] for name, _ in top_candidates]
+
+# 使用
+retriever = ToolRetriever(all_100_tools)
+relevant_tools = retriever.retrieve(user_query, top_k=8)
+# 只把这 8 个工具传给 LLM
+result = llm.chat(messages=messages, tools=relevant_tools)
+```
+
+**进阶：加重排序**
+
+```python
+def retrieve_and_rerank(query, top_k=8):
+    # 粗筛：embedding 检索 top-20
+    candidates = retriever.retrieve(query, top_k=20)
+    
+    # 精排：用 LLM 或 cross-encoder 重排序
+    reranked = reranker.rerank(
+        query=query,
+        documents=[t.description for t in candidates],
+        top_k=top_k,
+    )
+    
+    return [candidates[i] for i in reranked.indices]
+```
+
+### 解决方案三：工具描述优化
+
+工具选择的准确率很大程度取决于**工具描述的区分度**：
+
+```python
+# ❌ 差的描述：模糊、重叠
+{"name": "search", "description": "搜索信息"}
+{"name": "query", "description": "查询数据"}
+
+# ✅ 好的描述：明确职责、区分边界、含示例
+{
+    "name": "search_product_catalog",
+    "description": (
+        "在商品目录中搜索商品。"
+        "输入商品名称或类目关键词，返回匹配的商品列表。"
+        "仅用于搜索商品信息，不涉及订单或用户操作。"
+        "示例输入: '红色连衣裙', 'iPhone 15 手机壳'"
+    ),
+}
+```
+
+**描述优化清单**：
+1. 说清楚工具**做什么**和**不做什么**
+2. 说清楚**什么时候用**（触发条件）
+3. 给出 2-3 个**输入示例**
+4. 与容易混淆的工具**显式区分**（"用 X 查询商品，用 Y 查询订单"）
+
+### 解决方案四：工具分组 + 延迟加载
+
+```python
+class LazyToolLoader:
+    def __init__(self):
+        # 只加载工具的元信息（名称 + 简短描述）
+        self.tool_index = {
+            "payment_tools": "处理支付相关操作（创建支付、退款、查询支付状态）",
+            "order_tools": "处理订单相关操作（创建、修改、取消、查询订单）",
+            "user_tools": "处理用户相关操作（个人信息、密码、偏好设置）",
+        }
+        # 完整定义按需加载
+        self._loaded_groups = {}
+    
+    def get_tool_index_prompt(self) -> str:
+        """第一次调用只传工具组的索引（几百 token）"""
+        return "\n".join(
+            f"- {name}: {desc}" for name, desc in self.tool_index.items()
+        )
+    
+    def load_group(self, group_name: str) -> list:
+        """LLM 选定工具组后，再加载完整定义"""
+        if group_name not in self._loaded_groups:
+            self._loaded_groups[group_name] = load_tool_definitions(group_name)
+        return self._loaded_groups[group_name]
+```
+
+### 综合架构
+
+```
+用户输入
+  ↓
+[关键词匹配] → 命中高频工具 → 直接使用（<1ms）
+  ↓ 未命中
+[Embedding 检索] → Top-8 候选工具
+  ↓
+[LLM Function Calling] → 从 8 个中选 1-2 个
+  ↓
+执行工具
+```
+
+| 阶段 | 方法 | 延迟 | 覆盖率 |
+|---|---|---|---|
+| 关键词匹配 | 规则/关键词 | <1ms | ~40% 明确请求 |
+| Embedding 检索 | 向量相似度 | ~5ms | ~95% |
+| LLM 选择 | Function Calling | ~200ms | ~99% |
+
+**核心原则**：不要把 100 个工具全部塞给 LLM——先缩小范围（通过路由/检索/分组），再让 LLM 在小范围内精确选择。
+
+- 标签: `tool-selection`, `tool-routing`, `embedding-retrieval`, `function-calling`, `scalability`
+- 记录于: 2026-06-20
