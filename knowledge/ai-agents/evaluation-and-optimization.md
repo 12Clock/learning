@@ -263,3 +263,167 @@ Continuous: [A██][+B][A██B█][+C][A██B█C█][B done→+D][A██
 
 - 标签: `llm-inference`, `kv-cache`, `continuous-batching`, `vllm`, `quantization`, `optimization`
 - 记录于: 2026-06-19
+
+## Q: Agentic CPT、SFT、RL 三阶段训练流程分别是什么？为什么 SFT 时要 mask observation tokens？
+
+### 概览：三阶段训练 Agent 专用大模型
+
+通用 LLM 并不天然擅长 Agent 任务（多步推理、工具调用、环境交互）。要训练一个"Agent 原生"的大模型，通常经过三个阶段：
+
+```
+基座模型 (Base LLM)
+  ↓ 阶段 1: Agentic CPT (Continual Pre-Training)
+注入 Agent 领域知识
+  ↓ 阶段 2: Agentic SFT (Supervised Fine-Tuning)
+学习 Agent 行为模式
+  ↓ 阶段 3: Agentic RL (Reinforcement Learning)
+优化决策策略
+  ↓
+Agent 专用模型
+```
+
+### 阶段 1：Agentic CPT（持续预训练）
+
+**目标**：让基座模型理解 Agent 相关的概念和知识，不改变其"行为模式"，只扩充知识面。
+
+**训练数据**：
+
+| 数据类型 | 示例 | 作用 |
+|---|---|---|
+| API/工具文档 | Swagger 文档、SDK 文档 | 理解工具的功能和参数 |
+| 代码仓库 | GitHub 上的 Agent 框架代码 | 理解代码执行逻辑 |
+| Agent 交互日志 | ReAct 轨迹、函数调用记录 | 熟悉 Thought-Action-Observation 格式 |
+| 领域知识 | 任务规划论文、操作手册 | 理解领域术语和流程 |
+
+**训练方式**：标准语言模型目标（next token prediction），学习率比预训练低 1-2 个数量级（如 2e-5），防止遗忘通用能力。
+
+```python
+# CPT 阶段：标准语言模型训练，所有 token 都参与损失计算
+loss = cross_entropy(model(input_tokens), target_tokens)
+# 全量 token 都计算 loss，不做 mask
+```
+
+### 阶段 2：Agentic SFT（监督微调）
+
+**目标**：让模型学会 Agent 的行为模式——何时思考、何时调用工具、如何解读结果。
+
+**训练数据**：人工标注或强模型生成的高质量 Agent 轨迹。
+
+```
+一条训练样本（Agent 轨迹）:
+┌─────────────────────────────────────────────────────┐
+│ System: 你是一个天气助手，可用工具: get_weather(...)   │ ← 系统指令
+│ User: 北京和上海明天谁更热？                          │ ← 用户输入
+│ Thought: 需要分别查两个城市                           │ ← 模型应学会生成
+│ Action: get_weather(city="北京", date="明天")         │ ← 模型应学会生成
+│ Observation: {"temp": 35}                            │ ← 环境返回（非模型生成）
+│ Thought: 北京35度，再查上海                           │ ← 模型应学会生成
+│ Action: get_weather(city="上海", date="明天")         │ ← 模型应学会生成
+│ Observation: {"temp": 32}                            │ ← 环境返回（非模型生成）
+│ Thought: 北京35 > 上海32                             │ ← 模型应学会生成
+│ Answer: 北京明天更热，35°C vs 32°C                   │ ← 模型应学会生成
+└─────────────────────────────────────────────────────┘
+```
+
+#### 为什么要 mask observation tokens？
+
+**Observation 是环境返回的真实数据，不是模型生成的。** 如果让模型在这些 token 上计算 loss，等于在教模型"记忆工具的返回值"——这既不可能（返回值是动态的），也会引入噪声。
+
+```python
+# SFT 阶段的 loss 计算（关键区别）
+def compute_agent_sft_loss(trajectory):
+    tokens = tokenize(trajectory)
+    labels = tokens.clone()
+    
+    # mask 掉不应该学习的部分
+    for span in trajectory.spans:
+        if span.role in ("system", "user", "observation"):
+            labels[span.start:span.end] = IGNORE_INDEX  # -100
+    
+    # 只在模型应该生成的部分计算 loss
+    # 即 Thought、Action、Answer
+    loss = cross_entropy(model(tokens), labels, ignore_index=IGNORE_INDEX)
+    return loss
+```
+
+**mask 的具体原因**：
+
+| 原因 | 详细说明 |
+|---|---|
+| **不可预测性** | Observation 内容由外部环境决定（API 返回值、数据库查询结果），模型不应试图"预测"这些值 |
+| **防止幻觉** | 如果模型学习了特定的 observation pattern，推理时可能在没有真正调用工具的情况下"编造"返回值 |
+| **梯度噪声** | Observation 的分布与模型生成的文本分布不同（JSON、数据表等），在其上计算 loss 会引入梯度噪声，干扰对 Thought/Action 的学习 |
+| **因果错误** | 模型应学习"根据 observation 做判断"，而非"预测 observation 内容"——mask 确保因果方向正确 |
+
+```
+训练时的 loss mask 示意:
+  [System...]  [User...]  [Thought...]  [Action...]  [Observation...]  [Thought...]  [Answer...]
+  ████████████ ██████████ ▓▓▓▓▓▓▓▓▓▓▓▓ ▓▓▓▓▓▓▓▓▓▓▓ ████████████████ ▓▓▓▓▓▓▓▓▓▓▓▓ ▓▓▓▓▓▓▓▓▓▓
+  █ = masked (不计算 loss)   ▓ = 计算 loss (模型应学会生成的部分)
+```
+
+### 阶段 3：Agentic RL（强化学习）
+
+**目标**：通过试错优化 Agent 的**决策策略**——选择哪个工具、何时停止、如何规划多步。
+
+**为什么 SFT 不够**：SFT 只能模仿示范轨迹中的行为，不能发现更优的策略。RL 通过奖励信号让模型探索并强化更好的决策路径。
+
+**训练流程**：
+
+```
+模型在环境中交互 → 产生轨迹 → 评估轨迹质量（奖励） → 更新策略
+```
+
+**奖励设计**：
+
+```python
+def compute_reward(trajectory):
+    reward = 0.0
+    
+    # 1. 任务完成度（核心奖励）
+    if task_completed_correctly(trajectory):
+        reward += 1.0
+    
+    # 2. 效率惩罚（鼓励用更少步骤完成）
+    reward -= 0.05 * len(trajectory.steps)
+    
+    # 3. 工具使用质量
+    for step in trajectory.steps:
+        if step.action == "unnecessary_tool_call":
+            reward -= 0.1  # 惩罚无意义的工具调用
+        if step.action == "correct_tool_selection":
+            reward += 0.1  # 奖励选对工具
+    
+    # 4. 安全约束
+    if violates_safety_rules(trajectory):
+        reward = -1.0  # 强惩罚违规行为
+    
+    return reward
+```
+
+**常用 RL 算法**：
+
+| 算法 | 特点 | 适用场景 |
+|---|---|---|
+| **PPO** | 稳定、广泛使用 | 通用 Agent 策略优化 |
+| **GRPO** | Group Relative Policy Optimization，DeepSeek 提出 | 数学/代码推理 |
+| **DPO** | 直接偏好优化，无需显式奖励模型 | 有人类偏好数据时 |
+| **ReST** | 自博弈 + 过滤，迭代生成→筛选→训练 | 可自动验证结果的任务 |
+
+### 三阶段协同关系
+
+```
+CPT:  知识注入  → 模型"知道"工具和 Agent 概念
+SFT:  行为对齐  → 模型"会做"工具调用和推理
+RL:   策略优化  → 模型"做得好"，选择最优行动序列
+
+类比：
+CPT = 读教材（获取知识）
+SFT = 看范例 + 做习题（模仿行为）
+RL  = 实战 + 复盘（优化策略）
+```
+
+**不是每个阶段都必须**：很多实际方案跳过 CPT 直接做 SFT（如 Toolformer），或跳过 RL 只做 SFT（如大部分开源 Agent 模型）。但最强的 Agent 模型（如 Claude、GPT-4）通常三阶段都做。
+
+- 标签: `agentic-training`, `cpt`, `sft`, `rl`, `observation-masking`, `reward-design`
+- 记录于: 2026-06-20

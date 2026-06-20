@@ -117,3 +117,186 @@ GraphRAG 提供两种查询模式：
 
 - 标签: `graphrag`, `microsoft`, `knowledge-graph`, `community-detection`, `leiden`, `drift-search`
 - 记录于: 2026-06-18
+
+## Q: RAG 流程中为什么要引入父子索引？BM25 和向量检索如何融合？
+
+### 父子索引（Parent-Child Indexing）
+
+#### 核心矛盾
+
+RAG 中的文档分块存在**检索粒度与上下文完整性的矛盾**：
+
+```
+小 chunk（200 token）：
+  ✅ 检索精准——embedding 向量语义集中，相似度计算准确
+  ❌ 上下文不足——送给 LLM 的内容太碎片，LLM 无法理解完整语境
+
+大 chunk（2000 token）：
+  ✅ 上下文完整——LLM 能看到足够的背景信息
+  ❌ 检索模糊——embedding 向量混合了多个语义，相似度计算被稀释
+```
+
+**父子索引的解决思路：用小块检索、返回大块。**
+
+#### 工作原理
+
+```
+原始文档
+  ↓ 分块
+父 chunk（大，800-2000 token）
+  ├─ 子 chunk 1（小，200 token）→ 生成 embedding → 存入向量库
+  ├─ 子 chunk 2（小，200 token）→ 生成 embedding → 存入向量库
+  └─ 子 chunk 3（小，200 token）→ 生成 embedding → 存入向量库
+
+检索时:
+  Query → 向量检索 → 命中子 chunk 2
+                      ↓ 通过 parent_id 回溯
+                    返回父 chunk（包含子 1+2+3 的完整上下文）
+```
+
+```python
+from langchain.retrievers import ParentDocumentRetriever
+
+# 两种分块器
+parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
+child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
+
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,          # 子 chunk 的 embedding 存这里
+    docstore=InMemoryStore(),         # 父 chunk 存这里（原文）
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+
+# 检索：用子 chunk embedding 匹配，返回父 chunk 原文
+results = retriever.get_relevant_documents("什么是注意力机制？")
+# 返回的是完整的父 chunk，而非碎片化的子 chunk
+```
+
+#### 变体
+
+| 变体 | 思路 | 适用场景 |
+|---|---|---|
+| **Sentence Window** | 检索单句，返回前后 N 句窗口 | 内容结构松散 |
+| **父子 chunk** | 检索小 chunk，返回父 chunk | 内容有层次结构 |
+| **摘要索引** | 对大 chunk 生成摘要做 embedding，命中后返回原文 | 文档很长时 |
+
+### BM25 与向量检索的融合
+
+#### 为什么要融合？
+
+两种检索方法各有盲区：
+
+| 维度 | BM25（词频统计） | 向量检索（语义匹配） |
+|---|---|---|
+| **擅长** | 精确关键词匹配、专有名词、编号 | 语义相似、同义词、跨语言 |
+| **短板** | 无法理解同义词和语义 | 对精确关键词不敏感 |
+| **典型失败** | "LLM 推理优化" 查不到 "大模型加速" | "订单号 ABC123" 查不到精确匹配 |
+| **速度** | 极快（倒排索引） | 较快（ANN 检索） |
+
+```
+用户查询: "Transformer attention 机制的 PyTorch 实现"
+
+BM25 会命中:   包含 "Transformer"、"attention"、"PyTorch" 这些词的文档
+向量检索会命中: 语义相关的文档（可能标题是"自注意力的代码实现"，不含原关键词）
+融合后:        两种结果互补，覆盖率更高
+```
+
+#### 融合方法一：RRF（Reciprocal Rank Fusion）
+
+最常用、最简单的融合方法。**不需要归一化分数**，只使用排名：
+
+```python
+def reciprocal_rank_fusion(result_lists: list[list], k=60) -> list:
+    """
+    result_lists: 多个检索器返回的排序结果列表
+    k: 常数，控制高排名文档的权重（通常 60）
+    """
+    scores = {}
+    for result_list in result_lists:
+        for rank, doc in enumerate(result_list):
+            if doc.id not in scores:
+                scores[doc.id] = 0
+            scores[doc.id] += 1.0 / (k + rank + 1)
+    
+    # 按融合分数降序排列
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+# 使用
+bm25_results = bm25_search(query, top_k=20)
+vector_results = vector_search(query, top_k=20)
+fused = reciprocal_rank_fusion([bm25_results, vector_results])
+```
+
+**RRF 的数学直觉**：排名第 1 的文档得分 `1/(60+1) ≈ 0.016`，排名第 10 的得分 `1/(60+10) ≈ 0.014`。如果一个文档在两个列表中都排前几名，它的融合分数会远高于只在一个列表中排名靠前的文档。
+
+#### 融合方法二：加权分数融合
+
+当两个检索器的分数可比（归一化后）时，直接加权：
+
+```python
+def weighted_fusion(bm25_results, vector_results, alpha=0.5):
+    """alpha: 向量检索的权重"""
+    # 分数归一化到 [0, 1]
+    bm25_scores = normalize(bm25_results)
+    vector_scores = normalize(vector_results)
+    
+    all_docs = set(bm25_scores.keys()) | set(vector_scores.keys())
+    fused = {}
+    for doc_id in all_docs:
+        bm25_s = bm25_scores.get(doc_id, 0)
+        vector_s = vector_scores.get(doc_id, 0)
+        fused[doc_id] = (1 - alpha) * bm25_s + alpha * vector_s
+    
+    return sorted(fused.items(), key=lambda x: x[1], reverse=True)
+```
+
+**alpha 的调参经验**：
+- `alpha=0.7`（偏向量）：通用问答、语义搜索
+- `alpha=0.3`（偏 BM25）：技术文档、含大量专有名词
+- `alpha=0.5`：默认起点
+
+#### 工程实现：Elasticsearch + 向量库
+
+```python
+# 方案 A：Elasticsearch 8.x 原生混合搜索
+response = es.search(
+    index="documents",
+    query={
+        "bool": {
+            "should": [
+                {"match": {"content": query}},  # BM25
+                {"knn": {                        # 向量检索
+                    "field": "embedding",
+                    "query_vector": embed(query),
+                    "k": 20,
+                }},
+            ]
+        }
+    },
+    rank={"rrf": {"window_size": 100, "rank_constant": 60}}  # RRF 融合
+)
+
+# 方案 B：分开检索 + 自行融合
+bm25_hits = es.search(query={"match": {"content": query}}, size=20)
+vector_hits = milvus.search(embed(query), top_k=20)
+final = reciprocal_rank_fusion([bm25_hits, vector_hits])
+```
+
+### 父子索引 + 混合检索的组合
+
+```
+Query → BM25 检索子 chunk → Top-K₁
+      → 向量检索子 chunk   → Top-K₂
+               ↓
+        RRF 融合 → Top-K 子 chunk
+               ↓
+        通过 parent_id 回溯 → 去重 → 父 chunk 列表
+               ↓
+        送入 LLM 生成回答
+```
+
+这是当前生产级 RAG 系统中**最常见的完整检索架构**。
+
+- 标签: `rag`, `parent-child-index`, `bm25`, `hybrid-search`, `rrf`, `retrieval`
+- 记录于: 2026-06-20

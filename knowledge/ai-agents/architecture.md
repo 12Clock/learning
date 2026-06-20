@@ -266,3 +266,184 @@ async def voting_intent(query: str):
 
 - 标签: `intent-recognition`, `parallel`, `latency-optimization`, `fan-out`
 - 记录于: 2026-06-19
+
+## Q: ReAct 框架的工程实现细节？消息格式如何设计？tool_response 用什么角色传回？为什么？
+
+### ReAct 核心循环
+
+ReAct（Reasoning + Acting）让 LLM 在**思考（Thought）→ 行动（Action）→ 观察（Observation）**的循环中解决问题：
+
+```
+用户提问
+  ↓
+┌──────────────────────────────────┐
+│ Thought: 我需要查询天气 API       │ ← LLM 生成推理过程
+│ Action: get_weather(city="北京")  │ ← LLM 输出工具调用
+└──────────────────────────────────┘
+  ↓ 系统执行工具
+┌──────────────────────────────────┐
+│ Observation: {"temp": 28, ...}   │ ← 工具返回结果
+└──────────────────────────────────┘
+  ↓ 结果回传给 LLM
+┌──────────────────────────────────┐
+│ Thought: 已拿到结果，可以回答了   │
+│ Answer: 北京今天 28°C...          │ ← LLM 生成最终回答
+└──────────────────────────────────┘
+```
+
+### 消息格式设计
+
+现代 API（OpenAI / Anthropic）的消息格式直接支持 ReAct 模式。关键是**四种角色**的配合：
+
+```python
+messages = [
+    # 1. system：定义 Agent 身份和可用工具
+    {"role": "system", "content": "你是一个天气助手..."},
+    
+    # 2. user：用户输入
+    {"role": "user", "content": "北京明天天气怎么样？"},
+    
+    # 3. assistant：LLM 的思考 + 工具调用请求
+    {"role": "assistant", "content": None, "tool_calls": [
+        {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"city": "北京", "date": "tomorrow"}'
+            }
+        }
+    ]},
+    
+    # 4. tool：工具执行结果回传
+    {"role": "tool", "tool_call_id": "call_abc123",
+     "content": '{"temp": 28, "condition": "晴", "humidity": 45}'},
+    
+    # 5. assistant：LLM 基于观察生成最终回答
+    {"role": "assistant", "content": "北京明天晴，气温 28°C，湿度 45%。"}
+]
+```
+
+### tool_response 应该用 `tool` 角色传回——为什么？
+
+**用 `tool` 角色（而非 `user` 或 `system`）的三个核心原因**：
+
+**1. 语义区分——LLM 需要知道这不是人说的话**
+
+```python
+# ❌ 错误：用 user 角色传工具结果
+{"role": "user", "content": '{"temp": 28}'}
+# LLM 会困惑：这是用户在说 JSON？还是用户在提问？
+
+# ✅ 正确：用 tool 角色
+{"role": "tool", "tool_call_id": "call_abc123", "content": '{"temp": 28}'}
+# LLM 明确知道：这是我调用的工具返回的结果
+```
+
+用 `user` 角色会导致 LLM 将工具结果误解为用户的新输入，触发新的对话轮次而非继续推理。用 `system` 角色会与系统级指令混淆，且部分模型对 system 消息有特殊处理（如置顶注意力）。
+
+**2. 调用链追踪——`tool_call_id` 实现一一对应**
+
+```python
+# LLM 同时调用多个工具（并行 tool call）
+assistant_msg = {"role": "assistant", "tool_calls": [
+    {"id": "call_001", "function": {"name": "get_weather", "arguments": "..."}},
+    {"id": "call_002", "function": {"name": "get_news", "arguments": "..."}},
+]}
+
+# 每个 tool 结果通过 tool_call_id 精确匹配
+tool_msg_1 = {"role": "tool", "tool_call_id": "call_001", "content": "天气数据..."}
+tool_msg_2 = {"role": "tool", "tool_call_id": "call_002", "content": "新闻数据..."}
+```
+
+`tool` 角色携带 `tool_call_id`，让 LLM 知道哪个结果对应哪个调用。如果用 `user` 角色，多个工具结果会混在一起无法区分。
+
+**3. 训练信号——模型被训练为期望这种格式**
+
+现代 LLM（GPT-4、Claude）在 RLHF/SFT 阶段使用 `tool` 角色的对话数据训练。使用正确角色能触发模型训练中学到的"工具使用"行为模式，产生更准确的后续推理。
+
+### 完整工程实现
+
+```python
+import json
+
+class ReActAgent:
+    def __init__(self, llm_client, tools: dict):
+        self.llm = llm_client
+        self.tools = tools  # {"tool_name": callable}
+        self.max_iterations = 5
+    
+    def run(self, user_query: str) -> str:
+        messages = [
+            {"role": "system", "content": self._build_system_prompt()},
+            {"role": "user", "content": user_query},
+        ]
+        
+        for i in range(self.max_iterations):
+            response = self.llm.chat(
+                messages=messages,
+                tools=self._tool_definitions(),
+            )
+            
+            assistant_msg = response.message
+            messages.append(assistant_msg)
+            
+            # 没有工具调用 → LLM 认为可以直接回答了
+            if not assistant_msg.get("tool_calls"):
+                return assistant_msg["content"]
+            
+            # 执行每个工具调用，结果以 tool 角色回传
+            for tool_call in assistant_msg["tool_calls"]:
+                func_name = tool_call["function"]["name"]
+                func_args = json.loads(tool_call["function"]["arguments"])
+                
+                try:
+                    result = self.tools[func_name](**func_args)
+                    tool_content = json.dumps(result, ensure_ascii=False)
+                except Exception as e:
+                    tool_content = json.dumps({"error": str(e)})
+                
+                # 关键：用 tool 角色 + tool_call_id 回传
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": tool_content,
+                })
+        
+        return "达到最大迭代次数，无法完成任务。"
+```
+
+### Anthropic (Claude) 的差异
+
+Claude 的消息格式略有不同——工具结果放在 `user` 消息的 `tool_result` content block 中：
+
+```python
+# Claude 的格式
+messages = [
+    {"role": "user", "content": "北京天气？"},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_001",
+         "name": "get_weather", "input": {"city": "北京"}}
+    ]},
+    # 工具结果嵌入在 user 角色中，但通过 type 和 tool_use_id 区分
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_001",
+         "content": '{"temp": 28}'}
+    ]},
+]
+```
+
+虽然外层是 `user` 角色，但 `type: "tool_result"` + `tool_use_id` 在语义上等价于 OpenAI 的 `tool` 角色——模型内部能正确区分这是工具返回而非用户输入。
+
+### 消息链路中的常见坑
+
+| 问题 | 表现 | 解决 |
+|---|---|---|
+| tool_call_id 不匹配 | API 报错或 LLM 忽略结果 | 严格使用 LLM 返回的 id |
+| 工具结果太长 | 上下文溢出 | 截断/摘要后再传回（如只传前 2000 字符） |
+| 工具报错未处理 | LLM 反复重试同一调用 | 将错误信息作为 tool content 传回，让 LLM 决策 |
+| 缺少停止条件 | 无限循环 | 设 max_iterations + 超时 |
+| 并行调用结果顺序 | 结果乱序 | tool_call_id 保证匹配，顺序无关 |
+
+- 标签: `react`, `tool-calling`, `message-format`, `agent-loop`, `function-calling`
+- 记录于: 2026-06-20

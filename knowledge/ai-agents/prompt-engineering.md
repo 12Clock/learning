@@ -349,3 +349,163 @@ Prompt 优化 → 参数调整 → 换模型 → SFT → 全量微调/预训练
 
 - 标签: `prompt-optimization`, `sft`, `model-selection`, `decision-framework`
 - 记录于: 2026-06-19
+
+## Q: 上下文超出限制时如何处理？滑动窗口和动态摘要的区别？
+
+### 问题场景
+
+LLM 的上下文窗口有限（4K-200K tokens）。长对话或大量工具调用结果会导致上下文溢出：
+
+```
+System Prompt: ~500 tokens
+长期记忆注入:  ~500 tokens
+工具定义:      ~1000 tokens
+对话历史:      ~???? tokens  ← 这里不断增长
+当前用户输入:  ~200 tokens
+─────────────────────────
+总计不能超过:  128K tokens（以 GPT-4o 为例）
+```
+
+### 方案一：滑动窗口（Sliding Window）
+
+**思路**：只保留最近 N 轮对话，丢弃更早的。
+
+```python
+class SlidingWindowMemory:
+    def __init__(self, max_turns=10):
+        self.messages = []
+        self.max_turns = max_turns
+    
+    def add(self, message):
+        self.messages.append(message)
+    
+    def get_context(self):
+        # 保留 system prompt + 最近 N 轮
+        return self.system_prompt + self.messages[-self.max_turns * 2:]
+```
+
+```
+完整对话: [T1] [T2] [T3] [T4] [T5] [T6] [T7] [T8] [T9] [T10]
+窗口=6:                              [T5] [T6] [T7] [T8] [T9] [T10]
+                                      ↑ 窗口起点            ↑ 当前
+         T1-T4 的信息完全丢失
+```
+
+**优点**：
+- 实现极简，零额外 LLM 调用
+- 延迟零增加
+- 成本零增加
+
+**缺点**：
+- 早期信息**完全丢失**——如果用户在 T2 说了关键偏好，到 T8 就忘了
+- 窗口边界处可能切断语义连贯的对话
+
+### 方案二：动态摘要（Dynamic Summary）
+
+**思路**：将超出窗口的对话压缩为摘要，保留关键信息。
+
+```python
+class DynamicSummaryMemory:
+    def __init__(self, llm, max_tokens=4000):
+        self.llm = llm
+        self.summary = ""
+        self.recent = []
+        self.max_tokens = max_tokens
+    
+    def add(self, message):
+        self.recent.append(message)
+        
+        if self._total_tokens() > self.max_tokens:
+            # 将最早的几条消息压缩进摘要
+            to_compress = self.recent[:4]
+            self.recent = self.recent[4:]
+            
+            self.summary = self.llm.generate(
+                f"将以下对话摘要与新内容合并为一份简洁摘要，"
+                f"保留关键事实、用户偏好和未完成的任务：\n\n"
+                f"已有摘要:\n{self.summary}\n\n"
+                f"新对话:\n{format_messages(to_compress)}"
+            )
+    
+    def get_context(self):
+        return f"[对话摘要] {self.summary}\n\n[最近对话]\n{self.recent}"
+```
+
+```
+完整对话:    [T1] [T2] [T3] [T4] [T5] [T6] [T7] [T8] [T9] [T10]
+动态摘要:    [T1-T6 的摘要: "用户想订北京到上海的机票，偏好经济舱..."]
+             + [T7] [T8] [T9] [T10]
+             ↑ 信息有损但保留了关键内容
+```
+
+**优点**：
+- 早期信息**保留核心**——关键事实和用户偏好不会丢失
+- 信息密度高（摘要的信噪比远高于原始对话）
+
+**缺点**：
+- 需要额外的 LLM 调用（增加延迟和成本）
+- 摘要本身是有损的——细节和精确措辞会丢失
+- 摘要质量依赖 LLM 能力（可能遗漏关键信息或引入错误）
+
+### 核心对比
+
+| 维度 | 滑动窗口 | 动态摘要 |
+|---|---|---|
+| **信息保留** | 窗口外完全丢失 | 有损保留核心信息 |
+| **额外成本** | 零 | 每次压缩需调用 LLM |
+| **额外延迟** | 零 | 摘要生成 200-500ms |
+| **实现复杂度** | 极低 | 中等 |
+| **适用场景** | 短对话、信息时效性强 | 长对话、需要长期上下文 |
+| **失败模式** | 忘记早期关键信息 | 摘要遗漏或歪曲信息 |
+
+### 方案三：混合策略（实践中最常用）
+
+```python
+class HybridContextManager:
+    def __init__(self, llm, max_context_tokens=8000):
+        self.llm = llm
+        self.max_context = max_context_tokens
+        self.summary = ""
+        self.pinned = []     # 关键信息（永不丢弃）
+        self.recent = []     # 最近对话（滑动窗口）
+    
+    def add(self, message):
+        # 检测关键信息并固定
+        if self._is_critical(message):
+            self.pinned.append(message)
+        
+        self.recent.append(message)
+        
+        # 超限时：滑动窗口 + 对溢出部分做摘要
+        if self._total_tokens() > self.max_context:
+            overflow = self.recent[:len(self.recent)//2]
+            self.recent = self.recent[len(self.recent)//2:]
+            self.summary = self.llm.summarize(self.summary, overflow)
+    
+    def get_context(self):
+        # 高注意力区域放关键信息
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": f"对话摘要: {self.summary}"},
+            {"role": "system", "content": f"关键信息: {self.pinned}"},
+            *self.recent,  # 最近对话放最后（recency bias 友好）
+        ]
+    
+    def _is_critical(self, message):
+        # 用户明确表达偏好、确认关键决策、提供个人信息
+        critical_patterns = ["记住", "以后都", "我的地址是", "密码是"]
+        return any(p in message["content"] for p in critical_patterns)
+```
+
+**布局策略**：利用 LLM 的 U 形注意力分布——摘要和关键信息放在前面（system 区域，高注意力），最近对话放在后面（高注意力），中间区域放次要信息。
+
+### 其他补充方案
+
+| 方案 | 思路 | 适用场景 |
+|---|---|---|
+| **RAG 式记忆检索** | 将对话历史存入向量库，按需检索相关片段 | 超长对话（100+ 轮） |
+| **分层压缩** | 不同时间段用不同压缩率（越早压越狠） | 长时间跨度的交互 |
+| **Token 级修剪** | 用注意力分数修剪低注意力 token | 研究阶段，工程落地少 |
+
+- 标签: `context-management`, `sliding-window`, `dynamic-summary`, `context-overflow`, `memory`
+- 记录于: 2026-06-20

@@ -383,3 +383,207 @@ class AdaptiveSkillRouter:
 
 - 标签: `skill-retrieval`, `skill-routing`, `embedding-retrieval`, `scalability`, `deferred-loading`
 - 记录于: 2026-06-19
+
+## Q: Agent 的记忆机制怎么设计？短期记忆和长期记忆分别如何实现？
+
+### 记忆分类
+
+Agent 的记忆体系参照认知科学，通常分为三层：
+
+```
+┌─────────────────────────────────────────────┐
+│  感知记忆（Sensory Buffer）                   │ ← 当前输入（用户最新消息）
+│  ~当前 turn 的 raw input                     │
+├─────────────────────────────────────────────┤
+│  短期/工作记忆（Working Memory）              │ ← 当前任务上下文
+│  ~对话历史 + 当前意图 + 槽位状态               │
+│  容量有限，随任务结束释放                      │
+├─────────────────────────────────────────────┤
+│  长期记忆（Long-term Memory）                 │ ← 跨会话持久化
+│  ~用户偏好 + 历史交互摘要 + 学到的知识          │
+│  持久存储，按需检索                            │
+└─────────────────────────────────────────────┘
+```
+
+### 短期记忆（Working Memory）
+
+**职责**：维持当前对话/任务的上下文，让 Agent 在多轮交互中保持连贯。
+
+**实现方式一：对话缓冲区（Conversation Buffer）**
+
+```python
+class ConversationBufferMemory:
+    def __init__(self, max_turns=20):
+        self.messages = []
+        self.max_turns = max_turns
+    
+    def add(self, role: str, content: str):
+        self.messages.append({"role": role, "content": content})
+        # 超出限制时丢弃最早的消息
+        if len(self.messages) > self.max_turns * 2:
+            self.messages = self.messages[-self.max_turns * 2:]
+    
+    def get_context(self) -> list:
+        return self.messages
+```
+
+简单直接，但随对话增长会超出 LLM 上下文窗口。
+
+**实现方式二：对话摘要缓冲区（Summary Buffer）**
+
+```python
+class ConversationSummaryBufferMemory:
+    def __init__(self, llm, max_token_limit=2000):
+        self.llm = llm
+        self.summary = ""          # 早期对话的摘要
+        self.recent_messages = []  # 最近几轮的原文
+        self.max_token_limit = max_token_limit
+    
+    def add(self, role: str, content: str):
+        self.recent_messages.append({"role": role, "content": content})
+        
+        # 超出 token 限制时，将最早的消息压缩进摘要
+        while self._count_tokens() > self.max_token_limit:
+            oldest = self.recent_messages.pop(0)
+            self.summary = self.llm.summarize(
+                f"已有摘要:\n{self.summary}\n\n新消息:\n{oldest}"
+            )
+    
+    def get_context(self) -> str:
+        return f"对话摘要:\n{self.summary}\n\n最近对话:\n{self.recent_messages}"
+```
+
+**实现方式三：任务状态对象（Structured State）**
+
+```python
+class AgentWorkingMemory:
+    current_intent: str = None
+    slots: dict = {}              # 已填充的参数
+    pending_actions: list = []    # 待执行的操作
+    tool_results: dict = {}       # 工具调用结果
+    clarification_needed: list = [] # 需要追问的信息
+    
+    def to_prompt_context(self) -> str:
+        return f"""当前意图: {self.current_intent}
+已知参数: {json.dumps(self.slots, ensure_ascii=False)}
+待执行: {self.pending_actions}
+工具结果: {json.dumps(self.tool_results, ensure_ascii=False)}"""
+```
+
+结构化状态比原始对话历史更高效——信噪比高，token 消耗少。
+
+### 长期记忆（Long-term Memory）
+
+**职责**：跨会话记住用户偏好、历史交互模式和学到的知识。
+
+**实现方式一：向量数据库存储**
+
+```python
+class VectorLongTermMemory:
+    def __init__(self, vectorstore, llm):
+        self.vectorstore = vectorstore  # Milvus / Pinecone / Chroma
+        self.llm = llm
+    
+    def save_memory(self, session_id: str, conversation: list):
+        # 会话结束时，提取关键信息存入长期记忆
+        key_info = self.llm.extract(
+            f"从以下对话中提取需要长期记住的信息（用户偏好、重要事实、待办事项）:\n"
+            f"{conversation}"
+        )
+        
+        for item in key_info:
+            self.vectorstore.add(
+                text=item.content,
+                metadata={
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "type": item.type,  # preference / fact / todo
+                }
+            )
+    
+    def recall(self, query: str, top_k=5) -> list:
+        # 根据当前对话内容检索相关的长期记忆
+        return self.vectorstore.similarity_search(query, k=top_k)
+```
+
+**实现方式二：结构化用户画像**
+
+```python
+class UserProfile:
+    user_id: str
+    preferences: dict = {
+        "language": "zh-CN",
+        "response_style": "concise",
+        "timezone": "Asia/Shanghai",
+    }
+    facts: list = [
+        {"content": "用户是 Python 开发者", "confidence": 0.9},
+        {"content": "用户偏好 CLI 工具", "confidence": 0.85},
+    ]
+    interaction_stats: dict = {
+        "total_sessions": 42,
+        "most_used_tools": ["code_search", "file_edit"],
+        "avg_session_length": 15,
+    }
+```
+
+**实现方式三：知识图谱**
+
+```
+User_A --[prefers]--> Python
+User_A --[works_at]--> Company_X
+User_A --[asked_about]--> "Redis 缓存策略" (2026-06-15)
+User_A --[asked_about]--> "Agent 架构" (2026-06-19)
+```
+
+适合关系复杂、需要推理的场景（"用户之前问过什么相关问题？"）。
+
+### 记忆的读写时机
+
+```
+会话开始:
+  1. 从长期记忆中检索与用户相关的背景信息
+  2. 注入 system prompt（"该用户偏好简洁回答，是 Python 开发者"）
+
+对话进行中:
+  3. 短期记忆实时更新（每轮追加消息或更新状态）
+  4. 触发关键事件时写入长期记忆（用户明确表达偏好："以后别用emoji"）
+
+会话结束:
+  5. 将短期记忆中的关键信息提炼后写入长期记忆
+  6. 清空短期记忆
+```
+
+### 实际架构
+
+```python
+class MemoryManager:
+    def __init__(self, user_id):
+        self.working = AgentWorkingMemory()
+        self.buffer = ConversationSummaryBufferMemory(llm, max_token_limit=3000)
+        self.long_term = VectorLongTermMemory(vectorstore, llm)
+        self.profile = load_user_profile(user_id)
+    
+    def build_context(self, current_query: str) -> str:
+        # 组装完整的记忆上下文
+        long_term_recall = self.long_term.recall(current_query, top_k=3)
+        
+        return f"""
+## 用户画像
+{self.profile.to_prompt()}
+
+## 相关长期记忆
+{format_memories(long_term_recall)}
+
+## 当前任务状态
+{self.working.to_prompt_context()}
+
+## 对话历史
+{self.buffer.get_context()}
+"""
+```
+
+**核心原则**：短期记忆保证连贯性（会话内），长期记忆保证个性化（跨会话）。两者的分界线是**会话结束**这个事件——结束时提炼、持久化、清空。
+
+- 标签: `memory`, `working-memory`, `long-term-memory`, `user-profile`, `vector-store`, `agent-memory`
+- 记录于: 2026-06-20

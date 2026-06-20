@@ -233,3 +233,148 @@ handler(data)
 
 - 标签: `mock`, `unit-test`, `dependency-injection`, `testing-strategy`
 - 记录于: 2026-06-19
+
+## Q: MySQL 索引在什么情况下会失效？LIKE 模糊查询时索引什么情况下失效？
+
+### 索引失效的常见场景
+
+#### 1. 对索引列使用函数或表达式
+
+```sql
+-- ❌ 索引失效：对 created_at 使用了函数
+SELECT * FROM orders WHERE YEAR(created_at) = 2026;
+
+-- ✅ 改写：范围查询，索引生效
+SELECT * FROM orders 
+WHERE created_at >= '2026-01-01' AND created_at < '2027-01-01';
+```
+
+```sql
+-- ❌ 索引失效：对列做运算
+SELECT * FROM orders WHERE price + 10 > 100;
+
+-- ✅ 改写：把运算移到值一侧
+SELECT * FROM orders WHERE price > 90;
+```
+
+**原因**：B+Tree 索引存储的是列的原始值。对列施加函数后，MySQL 无法直接在索引中查找变换后的值，只能全表扫描。
+
+#### 2. 隐式类型转换
+
+```sql
+-- phone 是 VARCHAR 类型
+-- ❌ 索引失效：传入数字，MySQL 做隐式转换
+SELECT * FROM users WHERE phone = 13800138000;
+
+-- ✅ 索引生效：传入字符串
+SELECT * FROM users WHERE phone = '13800138000';
+```
+
+**原因**：MySQL 将 VARCHAR 列的每个值转为数字来比较，等价于对列施加了 `CAST()` 函数。但反过来，如果列是 INT 而传入字符串，MySQL 会转换值而非列，索引仍然生效。
+
+#### 3. 联合索引不满足最左前缀
+
+```sql
+-- 联合索引 idx(a, b, c)
+SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;  -- ✅ 全部命中
+SELECT * FROM t WHERE a = 1 AND b = 2;              -- ✅ 命中 a, b
+SELECT * FROM t WHERE a = 1;                         -- ✅ 命中 a
+SELECT * FROM t WHERE b = 2 AND c = 3;              -- ❌ 跳过 a，索引失效
+SELECT * FROM t WHERE a = 1 AND c = 3;              -- ⚠️ 只命中 a，c 无法用索引
+```
+
+**原因**：B+Tree 按 (a, b, c) 的顺序排列。不知道 a 的值就无法定位 b 的范围，就像字典中不知道首字母就无法翻到对应页。
+
+#### 4. OR 条件中包含未索引列
+
+```sql
+-- a 有索引，b 无索引
+-- ❌ 索引失效：OR 要求两侧都能用索引
+SELECT * FROM t WHERE a = 1 OR b = 2;
+
+-- ✅ 如果 a 和 b 都有索引 → MySQL 可能用 index_merge
+```
+
+#### 5. NOT、!=、NOT IN
+
+```sql
+-- ❌ 通常导致索引失效（优化器认为扫描成本更低）
+SELECT * FROM users WHERE status != 'active';
+SELECT * FROM users WHERE id NOT IN (1, 2, 3);
+
+-- ✅ 如果排除的范围很小，改为 IN
+SELECT * FROM users WHERE status IN ('inactive', 'banned', 'deleted');
+```
+
+**注意**：这不是绝对的。如果 `!=` 排除的数据量很小（如 99% 的数据都是 'active'），优化器可能仍然选择全表扫描，因为回表成本太高。
+
+#### 6. 范围查询后的列不走索引
+
+```sql
+-- 联合索引 idx(a, b, c)
+SELECT * FROM t WHERE a = 1 AND b > 10 AND c = 3;
+-- a: 等值查询 ✅ 索引命中
+-- b: 范围查询 ✅ 索引命中
+-- c: b 之后的列 ❌ 索引不生效（B+Tree 在范围查询后无法继续有序查找）
+```
+
+#### 7. SELECT * 导致回表代价过高
+
+```sql
+-- 即使有索引，优化器可能因为回表成本太高而选择全表扫描
+-- ❌ 需要回表取所有列
+SELECT * FROM orders WHERE status = 'pending';
+
+-- ✅ 覆盖索引（不需要回表）
+SELECT id, status FROM orders WHERE status = 'pending';
+```
+
+### LIKE 模糊查询与索引
+
+**核心规则：前缀匹配走索引，前导通配符不走索引。**
+
+```sql
+-- ✅ 索引生效：前缀确定，可以在 B+Tree 中定位范围
+SELECT * FROM users WHERE name LIKE '张%';
+-- 等价于 name >= '张' AND name < '张\xff'，B+Tree 范围扫描
+
+-- ❌ 索引失效：前导通配符，不知道从哪里开始查
+SELECT * FROM users WHERE name LIKE '%三';
+
+-- ❌ 索引失效：两端通配符
+SELECT * FROM users WHERE name LIKE '%张三%';
+```
+
+**原因**：B+Tree 按字典序排列。`LIKE '张%'` 能确定扫描的起止范围（所有以"张"开头的值连续存放），但 `LIKE '%三'` 无法确定任何范围——以"三"结尾的值散布在整棵树中。
+
+**需要前导通配符时的替代方案**：
+
+```sql
+-- 方案 1：全文索引（FULLTEXT INDEX）
+ALTER TABLE articles ADD FULLTEXT INDEX ft_content(content);
+SELECT * FROM articles WHERE MATCH(content) AGAINST('关键词');
+
+-- 方案 2：倒排索引（搜索引擎）
+-- 将数据同步到 Elasticsearch，用倒排索引做全文检索
+
+-- 方案 3：冗余反转列（适合后缀匹配）
+ALTER TABLE users ADD COLUMN name_reversed VARCHAR(50);
+UPDATE users SET name_reversed = REVERSE(name);
+CREATE INDEX idx_name_rev ON users(name_reversed);
+-- LIKE '%三' 变成 LIKE '三%' 的反转查询
+SELECT * FROM users WHERE name_reversed LIKE REVERSE('%三');
+```
+
+### 如何验证索引是否生效
+
+```sql
+EXPLAIN SELECT * FROM users WHERE name LIKE '张%';
+-- 关注以下字段:
+-- type:   ref/range（用了索引）vs ALL（全表扫描）
+-- key:    实际使用的索引名（NULL 表示没用索引）
+-- rows:   预估扫描行数
+-- Extra:  Using index（覆盖索引）/ Using where（需要回表过滤）
+```
+
+- 标签: `mysql`, `index`, `query-optimization`, `like`, `b-plus-tree`
+- 记录于: 2026-06-20
