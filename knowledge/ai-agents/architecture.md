@@ -927,3 +927,259 @@ class AgentMessage:
 
 - 标签: `multi-agent`, `three-layer-architecture`, `orchestration`, `communication`, `message-bus`, `event-driven`
 - 记录于: 2026-06-20
+
+## Q: MCP、A2A、Skills 和 Function Call 分别是什么？它们之间有什么区别？
+
+### 四者定位一句话
+
+| 概念 | 一句话定义 | 解决什么问题 |
+|---|---|---|
+| **Function Call** | LLM 输出结构化的函数调用请求 | 让 LLM 能"调函数" |
+| **MCP** | 工具/数据源的标准化接入协议 | 让工具能被任意 Agent 即插即用 |
+| **Skills** | Agent 的可复用能力单元 | 让 Agent 能组合高层能力 |
+| **A2A** | Agent 之间的标准化通信协议 | 让不同 Agent 能互相协作 |
+
+### Function Call（函数调用）
+
+**是什么**：LLM 的一种输出模式——模型不是输出自然语言，而是输出结构化的函数名 + 参数 JSON。
+
+```python
+# 定义工具
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "查询城市天气",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "date": {"type": "string"}
+            },
+            "required": ["city"]
+        }
+    }
+}]
+
+# LLM 输出
+response.tool_calls = [{
+    "id": "call_001",
+    "function": {
+        "name": "get_weather",
+        "arguments": '{"city": "北京", "date": "明天"}'
+    }
+}]
+# LLM 只输出"要调什么"，不执行——执行由应用层负责
+```
+
+**关键特征**：
+- 是 **LLM 层面**的能力，由模型提供商实现（OpenAI、Anthropic、Google）
+- LLM 只负责"决定调什么"，不负责执行
+- 各家格式略有不同但思路一致
+- 是其他三者的**底层基础**——MCP、Skills、A2A 最终都依赖 LLM 的 Function Call 能力
+
+### MCP（Model Context Protocol）
+
+**是什么**：Anthropic 提出的开放协议，标准化 LLM 应用与外部数据源/工具的连接方式。
+
+```
+传统方式（每个工具写一遍适配）:
+  Agent ─── 自定义代码 ──→ GitHub API
+  Agent ─── 自定义代码 ──→ Slack API
+  Agent ─── 自定义代码 ──→ 数据库
+  N 个 Agent × M 个工具 = N×M 个适配器
+
+MCP 方式（标准协议）:
+  Agent ──→ MCP Client ──→ MCP Server (GitHub)
+  Agent ──→ MCP Client ──→ MCP Server (Slack)
+  Agent ──→ MCP Client ──→ MCP Server (数据库)
+  N 个 Agent × 1 个 MCP Client + M 个 MCP Server = N+M 个组件
+```
+
+**MCP 的三层架构**：
+
+```
+┌─────────────────┐
+│  MCP Host        │ ← 如 Claude Desktop、IDE、自定义 Agent
+│  (LLM 应用)      │
+├─────────────────┤
+│  MCP Client      │ ← 协议客户端，与 Server 通信
+├─────────────────┤
+│  MCP Server      │ ← 暴露工具/资源/提示的服务端
+│  (工具提供方)     │    可以是本地进程或远程服务
+└─────────────────┘
+```
+
+**MCP Server 提供三种能力**：
+
+```python
+# 1. Tools（工具）——可执行的操作
+@mcp_server.tool()
+def search_code(query: str, repo: str) -> list:
+    """在代码仓库中搜索"""
+    return github_api.search(repo, query)
+
+# 2. Resources（资源）——可读取的数据
+@mcp_server.resource("file://{path}")
+def read_file(path: str) -> str:
+    """读取文件内容"""
+    return open(path).read()
+
+# 3. Prompts（提示模板）——可复用的提示
+@mcp_server.prompt()
+def code_review_prompt(code: str) -> str:
+    """代码审查提示模板"""
+    return f"请审查以下代码的安全性和质量:\n{code}"
+```
+
+**类比**：MCP 之于 Agent 工具，就像 USB 之于外设——标准化接口，即插即用。
+
+### Skills（技能/能力单元）
+
+**是什么**：Agent 的高层可复用能力模块，封装了"完成某类任务"所需的 Prompt + 工具 + 流程。
+
+```python
+# Skill 不是一个工具，而是一组工具 + 策略的封装
+class CodeReviewSkill:
+    """代码审查技能"""
+    
+    name = "code-review"
+    description = "审查代码的正确性、安全性和风格"
+    
+    # 技能依赖的工具
+    tools = [read_file, grep, run_linter, run_tests]
+    
+    # 技能的执行策略（Prompt + 流程）
+    def execute(self, diff: str) -> ReviewResult:
+        # Step 1: 静态分析
+        lint_result = run_linter(diff)
+        
+        # Step 2: LLM 审查（带专门的 Prompt）
+        review = llm.generate(
+            system=self.review_prompt,
+            user=f"代码变更:\n{diff}\n\nLint 结果:\n{lint_result}"
+        )
+        
+        # Step 3: 测试验证
+        test_result = run_tests()
+        
+        return ReviewResult(review, lint_result, test_result)
+```
+
+**Skill vs Function Call 的区别**：
+
+```
+Function Call: 原子操作
+  get_weather(city="北京")  ← 一个函数，一次调用
+
+Skill: 组合能力
+  code_review(diff)         ← 内部可能调用 5 个工具 + 多步推理
+                               相当于一个"小 Agent"
+```
+
+**Skill 在不同框架中的体现**：
+- **Claude Code**：`/code-review`、`/init`、`/deep-research` 等斜杠命令
+- **CrewAI**：Agent 的 `tools` + `backstory`（角色定义 ≈ Skill 的执行策略）
+- **LangGraph**：子图（SubGraph）封装为可复用的节点
+
+### A2A（Agent-to-Agent Protocol）
+
+**是什么**：Google 提出的开放协议，标准化不同 Agent 系统之间的通信和协作方式。
+
+```
+MCP 解决的问题:  Agent ↔ 工具（纵向集成）
+A2A 解决的问题:  Agent ↔ Agent（横向协作）
+
+MCP: "Agent 如何使用工具"
+A2A: "Agent 如何与其他 Agent 合作"
+```
+
+**A2A 的核心概念**：
+
+```
+┌────────────────┐         ┌────────────────┐
+│  Agent A        │         │  Agent B        │
+│  (客户端)       │  A2A    │  (服务端)       │
+│                 │ ←────→  │                 │
+│  "帮我分析这份  │  Task   │  "我是数据分析  │
+│   销售数据"     │  对象   │   专家 Agent"   │
+└────────────────┘         └────────────────┘
+```
+
+```python
+# A2A 的交互流程
+# 1. Agent A 发现 Agent B 的能力（通过 Agent Card）
+agent_b_card = {
+    "name": "DataAnalysisAgent",
+    "description": "专业数据分析 Agent",
+    "capabilities": ["statistical_analysis", "visualization"],
+    "endpoint": "https://agent-b.example.com/a2a",
+    "input_schema": {"type": "object", "properties": {...}},
+}
+
+# 2. Agent A 创建任务
+task = a2a_client.create_task(
+    agent_url="https://agent-b.example.com/a2a",
+    task={
+        "description": "分析 Q1 销售数据，生成趋势报告",
+        "input": {"data_url": "s3://..."},
+    }
+)
+
+# 3. Agent B 异步处理，A 轮询或订阅状态
+result = a2a_client.wait_for_completion(task.id)
+```
+
+**Agent Card**：每个 A2A Agent 发布一张"名片"（类似 MCP Server 的工具定义），描述自己的能力、输入输出格式、端点地址。其他 Agent 通过 Agent Card 发现和调用它。
+
+### 四者的关系与区别
+
+```
+层级关系:
+                    ┌─────────────────┐
+  应用层            │  A2A             │  Agent 间协作
+                    │  (横向通信)       │
+                    ├─────────────────┤
+  能力层            │  Skills          │  能力封装与复用
+                    │  (能力单元)       │
+                    ├─────────────────┤
+  集成层            │  MCP             │  工具/数据标准接入
+                    │  (纵向集成)       │
+                    ├─────────────────┤
+  基础层            │  Function Call   │  LLM 调用函数的能力
+                    │  (原子调用)       │
+                    └─────────────────┘
+```
+
+| 维度 | Function Call | MCP | Skills | A2A |
+|---|---|---|---|---|
+| **提出者** | OpenAI（广泛采用） | Anthropic | 各框架各自实现 | Google |
+| **层级** | LLM 层 | 集成层 | 应用层 | 系统层 |
+| **粒度** | 单个函数调用 | 工具+资源+提示 | 多步能力流程 | 跨系统任务委托 |
+| **标准化程度** | 各家略有不同 | 开放标准 | 无统一标准 | 开放标准 |
+| **交互对象** | LLM → 函数 | Agent → 工具/数据 | Agent 内部 | Agent → Agent |
+| **执行者** | 应用层代码 | MCP Server | Skill 内部逻辑 | 远程 Agent |
+| **类比** | 按键（按一个按钮） | USB 接口（接外设） | App（封装的应用） | API 网关（跨系统调用） |
+
+### 实际系统中的协作
+
+```
+一个完整的 Agent 系统可能同时使用四者:
+
+用户: "帮我分析竞品并写一份报告"
+
+1. Orchestrator Agent 收到请求
+   ↓ 通过 A2A 协议委托给 Research Agent
+2. Research Agent 开始工作
+   ↓ 激活 "competitive_analysis" Skill
+3. Skill 内部执行多步流程
+   ↓ 通过 MCP 连接 Google Search Server、GitHub Server
+4. 每次与工具交互
+   ↓ LLM 通过 Function Call 决定调用哪个工具、传什么参数
+5. 搜索结果返回 → Skill 内 LLM 分析 → 生成报告
+   ↓ 通过 A2A 将报告返回给 Orchestrator
+6. Orchestrator 汇总最终结果返回用户
+```
+
+- 标签: `mcp`, `a2a`, `skills`, `function-calling`, `protocol`, `tool-integration`, `agent-communication`
+- 记录于: 2026-06-20

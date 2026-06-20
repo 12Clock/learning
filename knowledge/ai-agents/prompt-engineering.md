@@ -846,3 +846,237 @@ def prioritized_clarification(intent, missing_params):
 
 - 标签: `ambiguous-input`, `habit-resolution`, `clarification`, `user-memory`, `slot-filling`
 - 记录于: 2026-06-20
+
+## Q: Agent 的上下文工程有哪些主流技术？如何设计有效的上下文管理策略？
+
+### 上下文工程的定义
+
+**上下文工程（Context Engineering）** 是指精心设计和管理 LLM 输入的完整上下文——不仅是 prompt 本身，而是 system prompt、对话历史、检索结果、工具输出、记忆注入等所有进入上下文窗口的信息的**组织、筛选和编排**。
+
+```
+上下文 ≠ Prompt
+Prompt 是你写的指令
+上下文是 LLM 看到的一切：指令 + 数据 + 历史 + 工具结果 + ...
+```
+
+### 七大主流技术
+
+#### 1. Write（编写）：System Prompt 与指令设计
+
+```python
+system_prompt = """
+## 角色
+你是一个客服 Agent，服务于电商平台。
+
+## 能力边界
+你可以：查询订单、处理退款、回答产品问题
+你不可以：修改价格、删除用户、访问财务数据
+
+## 行为约束
+- 每次回答不超过 200 字
+- 不确定时主动追问，不猜测
+- 涉及金额操作需用户二次确认
+
+## 输出格式
+始终使用 JSON: {"response": "...", "action": "...", "confidence": 0.x}
+"""
+```
+
+**关键**：Role → Capabilities → Constraints → Format 的结构化设计。
+
+#### 2. Select（选择）：RAG 检索与信息筛选
+
+从海量数据中选择与当前请求最相关的内容注入上下文：
+
+```python
+def select_context(query: str, sources: list) -> str:
+    # 向量检索 + BM25 混合
+    retrieved = hybrid_search(query, top_k=5)
+    
+    # Rerank：用交叉编码器对候选重排序
+    reranked = reranker.rerank(query, retrieved, top_k=3)
+    
+    # 长度控制：确保不超出预算
+    context = truncate_to_budget(reranked, max_tokens=2000)
+    
+    return context
+```
+
+不是"检索越多越好"——信息过多反而稀释关键内容（信噪比下降）。
+
+#### 3. Compress（压缩）：上下文压缩与摘要
+
+```python
+class ContextCompressor:
+    def compress(self, messages: list, budget: int) -> list:
+        total = count_tokens(messages)
+        
+        if total <= budget:
+            return messages  # 未超限，不压缩
+        
+        # 策略 1：对话历史摘要
+        old_messages = messages[:-6]  # 保留最近 3 轮
+        summary = llm.summarize(old_messages)
+        
+        # 策略 2：工具输出压缩
+        for msg in messages:
+            if msg["role"] == "tool" and count_tokens(msg) > 500:
+                msg["content"] = llm.summarize(
+                    msg["content"],
+                    instruction="保留关键数据点，去掉格式和冗余"
+                )
+        
+        return [{"role": "system", "content": f"摘要: {summary}"}] + messages[-6:]
+```
+
+#### 4. Isolate（隔离）：子 Agent 上下文隔离
+
+```python
+# 主 Agent 上下文窗口宝贵——把高消耗任务委托给子 Agent
+async def research_with_isolation(query: str):
+    # 子 Agent 在独立上下文中执行（不污染主 Agent）
+    result = await sub_agent.run(
+        task=f"搜索并总结: {query}",
+        # 子 Agent 有自己的 128K 上下文窗口
+    )
+    # 只返回精简结论给主 Agent（几百 token）
+    return result.summary  # 而非原始搜索结果（可能几万 token）
+```
+
+**效果**：主 Agent 的上下文保持精简，高消耗操作在隔离环境中完成。
+
+#### 5. Structure（结构化）：信息的层级组织
+
+```python
+def build_structured_context(request):
+    return f"""
+## [永久区] 系统指令
+{system_prompt}
+
+## [永久区] 用户画像
+{user_profile}
+
+## [半永久区] 当前任务状态
+目标: {task_state.goal}
+已完成: {task_state.completed_steps}
+待完成: {task_state.pending_steps}
+
+## [动态区] 检索结果
+{retrieved_context}
+
+## [动态区] 最近工具调用结果
+{recent_tool_results}
+
+## [动态区] 对话历史（最近 5 轮）
+{recent_messages}
+
+## [提醒区] 关键约束重申
+{critical_reminders}
+"""
+```
+
+**分区策略**：
+- **永久区**（System Prompt 头部）：始终存在，高注意力
+- **半永久区**：任务期间保持，定期更新
+- **动态区**：每轮变化，按需加载
+- **提醒区**（尾部）：利用 recency bias 强化关键信息
+
+#### 6. Route（路由）：上下文的动态组装
+
+```python
+def route_context(intent: str, entities: dict) -> ContextParts:
+    """不同意图加载不同的上下文模块"""
+    
+    parts = ContextParts()
+    parts.add(system_prompt)  # 始终加载
+    
+    if intent == "order_query":
+        parts.add(order_tools_description)
+        parts.add(fetch_order_data(entities["order_id"]))
+        # 不加载支付工具、不加载产品信息
+    
+    elif intent == "product_consult":
+        parts.add(product_tools_description)
+        parts.add(rag_search(entities["product_name"]))
+        # 不加载订单工具
+    
+    elif intent == "complaint":
+        parts.add(complaint_handling_policy)
+        parts.add(escalation_guidelines)
+        parts.add(customer_history(entities["user_id"]))
+    
+    return parts
+```
+
+**效果**：按需加载而非全量灌入，每次请求只包含相关上下文。
+
+#### 7. Refresh（刷新）：上下文的实时更新
+
+```python
+class ContextRefresher:
+    """在对话过程中动态更新上下文"""
+    
+    def after_tool_call(self, tool_result):
+        # 工具返回后更新任务状态
+        self.task_state.update(tool_result)
+    
+    def after_n_turns(self, n=5):
+        # 每 N 轮刷新上下文
+        self.compress_old_history()
+        self.refresh_pinned_facts()
+        self.update_task_progress()
+    
+    def on_intent_change(self, new_intent):
+        # 意图切换时重组上下文
+        self.archive_current_context()
+        self.load_context_for(new_intent)
+```
+
+### 完整的上下文管理策略
+
+```
+请求进入
+  ↓
+[1. Route] 根据意图决定加载哪些上下文模块
+  ↓
+[2. Select] RAG 检索 + 记忆召回相关信息
+  ↓
+[3. Structure] 按层级组织（永久→半永久→动态→提醒）
+  ↓
+[4. Compress] 检查 token 预算，压缩超限部分
+  ↓
+[5. Isolate] 高消耗子任务委托给子 Agent
+  ↓
+送入 LLM
+  ↓
+[6. Refresh] 根据 LLM 输出更新上下文状态
+  ↓
+下一轮
+```
+
+### Token 预算分配参考
+
+```
+总预算: 8000 tokens（假设）
+
+System Prompt:     1500 tokens  (19%)  ← 角色 + 工具定义
+用户画像/记忆:      500 tokens  (6%)
+任务状态:           300 tokens  (4%)
+检索结果:          2000 tokens  (25%)  ← 最大的可变部分
+工具结果:          1000 tokens  (12%)
+对话历史:          2000 tokens  (25%)
+安全缓冲:           700 tokens  (9%)   ← 预留给输出
+```
+
+### 常见反模式
+
+| 反模式 | 问题 | 改进 |
+|---|---|---|
+| **全量灌入** | 把所有历史/工具/文档都塞入 | 按需加载，先路由再检索 |
+| **无优先级** | 所有信息平等对待 | 分层组织，关键信息放高注意力区域 |
+| **不压缩** | 原文保留所有细节 | 旧信息摘要化，保留核心事实 |
+| **静态上下文** | System Prompt 写死不更新 | 根据任务进展动态调整 |
+| **忽略输出预算** | 全给输入不留输出空间 | 预留 10-20% 给模型生成 |
+
+- 标签: `context-engineering`, `rag`, `context-compression`, `context-routing`, `token-budget`, `prompt-design`
+- 记录于: 2026-06-20
